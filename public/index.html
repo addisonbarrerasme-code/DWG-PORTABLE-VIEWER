@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DWG/DXF Viewer</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #f0f0f0;
+      color: #333;
+    }
+
+    .container {
+      display: flex;
+      height: 100vh;
+      flex-direction: column;
+    }
+
+    .header {
+      background: #2c3e50;
+      color: white;
+      padding: 12px 16px;
+      border-bottom: 1px solid #34495e;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .header h1 {
+      font-size: 18px;
+      font-weight: 600;
+    }
+
+    .file-info {
+      font-size: 13px;
+      opacity: 0.8;
+    }
+
+    .main-content {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    .toolbar {
+      background: #ecf0f1;
+      padding: 12px;
+      border-right: 1px solid #bdc3c7;
+      width: 60px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .tool-btn {
+      width: 48px;
+      height: 48px;
+      border: 1px solid #bdc3c7;
+      background: white;
+      border-radius: 4px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      transition: all 0.2s;
+    }
+
+    .tool-btn:hover {
+      background: #3498db;
+      color: white;
+      border-color: #2980b9;
+    }
+
+    .tool-btn.active {
+      background: #3498db;
+      color: white;
+    }
+
+    .canvas-container {
+      flex: 1;
+      position: relative;
+      background: white;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    #canvas {
+      max-width: 100%;
+      max-height: 100%;
+      border: 1px solid #e0e0e0;
+    }
+
+    .loading {
+      font-size: 16px;
+      color: #7f8c8d;
+    }
+
+    .error {
+      color: #e74c3c;
+      font-size: 14px;
+      padding: 16px;
+      background: #fdeaea;
+      border: 1px solid #f5b7b1;
+      border-radius: 4px;
+      margin: 16px;
+    }
+
+    .properties-panel {
+      width: 250px;
+      background: #ecf0f1;
+      border-left: 1px solid #bdc3c7;
+      padding: 12px;
+      overflow-y: auto;
+      font-size: 12px;
+    }
+
+    .property-group {
+      margin-bottom: 16px;
+      background: white;
+      padding: 8px;
+      border-radius: 4px;
+    }
+
+    .property-group h3 {
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: #2c3e50;
+    }
+
+    .property-item {
+      display: flex;
+      justify-content: space-between;
+      padding: 4px 0;
+      border-bottom: 1px solid #f0f0f0;
+      align-items: center;
+    }
+
+    .property-item:last-child {
+      border-bottom: none;
+    }
+
+    .property-label {
+      font-weight: 500;
+      color: #555;
+    }
+
+    .property-value {
+      color: #7f8c8d;
+      text-align: right;
+      flex: 1;
+      margin-left: 8px;
+    }
+
+    .property-input {
+      width: 110px;
+      border: 1px solid #c7cfd5;
+      border-radius: 4px;
+      padding: 2px 4px;
+      font-size: 12px;
+      background: #fff;
+      color: #2c3e50;
+    }
+
+    .property-checkbox {
+      transform: translateY(1px);
+      accent-color: #2c3e50;
+    }
+
+    .drop-zone {
+      border: 2px dashed #3498db;
+      border-radius: 8px;
+      padding: 32px;
+      text-align: center;
+      color: #7f8c8d;
+    }
+
+    .drop-zone.active {
+      background: #ecf7ff;
+      border-color: #2980b9;
+    }
+
+    #hoverTooltip {
+      position: fixed;
+      pointer-events: none;
+      background: rgba(22, 26, 34, 0.93);
+      color: #e8eaf0;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 6px;
+      padding: 7px 11px;
+      font-size: 11.5px;
+      font-family: 'Segoe UI', 'Consolas', sans-serif;
+      line-height: 1.65;
+      white-space: pre;
+      z-index: 9999;
+      box-shadow: 0 3px 12px rgba(0,0,0,0.45);
+      display: none;
+      max-width: 340px;
+    }
+    #hoverTooltip .tt-type {
+      font-weight: 600;
+      color: #89d4ff;
+      display: block;
+      margin-bottom: 2px;
+    }
+    #hoverTooltip .tt-row {
+      display: block;
+      color: #c8cdd6;
+    }
+    #hoverTooltip .tt-label {
+      color: #7a8ca0;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>DWG/DXF Viewer</h1>
+      <div class="file-info" id="fileInfo">No file loaded</div>
+    </div>
+
+    <div class="main-content">
+      <div class="toolbar">
+        <button class="tool-btn" id="openBtn" title="Open File (Ctrl+O)">📁</button>
+        <button class="tool-btn" id="zoomInBtn" title="Zoom In">🔍+</button>
+        <button class="tool-btn" id="zoomOutBtn" title="Zoom Out">🔍-</button>
+        <button class="tool-btn" id="fitBtn" title="Fit to Screen">⬜</button>
+        <button class="tool-btn" id="panBtn" title="Pan">✋</button>
+        <button class="tool-btn" id="marqueeZoomBtn" title="Marquee Zoom (click then drag)">⬚+</button>
+        <button class="tool-btn" id="measureBtn" title="Measure Distance">📏</button>
+      </div>
+
+      <div class="canvas-container" id="canvasContainer">
+        <div class="drop-zone" id="dropZone">
+          <p>Drag and drop DWG/DXF files here</p>
+          <p style="font-size: 11px; margin-top: 8px;">or use File → Open</p>
+        </div>
+        <canvas id="canvas" style="display: none;"></canvas>
+        <div class="error" id="errorDisplay" style="display: none;"></div>
+      </div>
+
+      <div class="properties-panel" id="propertiesPanel">
+        <div class="property-group">
+          <h3>Drawing Info</h3>
+          <div class="property-item">
+            <span class="property-label">Format:</span>
+            <span class="property-value" id="format">—</span>
+          </div>
+          <div class="property-item">
+            <span class="property-label">Units:</span>
+            <span class="property-value" id="units">Unknown</span>
+          </div>
+          <div class="property-item">
+            <span class="property-label">Version:</span>
+            <span class="property-value" id="version">—</span>
+          </div>
+          <div class="property-item">
+            <span class="property-label">Size:</span>
+            <span class="property-value" id="size">—</span>
+          </div>
+        </div>
+
+        <div class="property-group">
+          <h3>Measurements</h3>
+          <div class="property-item">
+            <span class="property-label">Distance:</span>
+            <span class="property-value" id="distance">—</span>
+          </div>
+          <div class="property-item">
+            <span class="property-label">Angle:</span>
+            <span class="property-value" id="angle">—</span>
+          </div>
+        </div>
+
+        <div class="property-group">
+          <h3>View Options</h3>
+          <div class="property-item">
+            <span class="property-label">Background:</span>
+            <input type="color" id="bgColorInput" class="property-input" value="#ffffff">
+          </div>
+          <div class="property-item">
+            <span class="property-label">Entity Colors:</span>
+            <input type="checkbox" id="showColorsToggle" class="property-checkbox" checked>
+          </div>
+          <div class="property-item">
+            <span class="property-label">Annotations:</span>
+            <input type="checkbox" id="showAnnoToggle" class="property-checkbox" checked>
+          </div>
+          <div class="property-item">
+            <span class="property-label">Cross Hatching:</span>
+            <input type="checkbox" id="showHatchToggle" class="property-checkbox" checked>
+          </div>
+          <div class="property-item">
+            <span class="property-label">Space View:</span>
+            <select id="spaceViewSelect" class="property-input">
+              <option value="model">Model</option>
+              <option value="layout">Layout</option>
+              <option value="both">Both</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="property-group">
+          <h3>Selection</h3>
+          <div id="selectionList"></div>
+        </div>
+
+        <div class="property-group">
+          <h3>Layers</h3>
+          <div id="layersList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="hoverTooltip" role="tooltip" aria-hidden="true"></div>
+  <script src="renderer.js"></script>
+</body>
+</html>

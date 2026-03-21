@@ -1,0 +1,12 @@
+node_modules/
+dist/
+out/
+*.log
+.DS_Store
+.env
+.env.local
+coverage/
+.vscode/
+release/
+artifacts/
+build_out.txt

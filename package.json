@@ -1,0 +1,61 @@
+{
+  "name": "dwl-viewer",
+  "version": "1.0.0",
+  "description": "Portable DWG/DXF Viewer using WebAssembly libdxfrw",
+  "main": "dist/main.js",
+  "author": "",
+  "license": "GPL-3.0",
+  "scripts": {
+    "start": "electron .",
+    "dev": "concurrently \"npm run watch\" \"electron .\"",
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "test:regression": "node scripts/regression-smoke.js",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win"
+  },
+  "dependencies": {
+    "@mlightcad/libdxfrw-web": "^0.1.0",
+    "@mlightcad/libredwg-web": "^0.6.6",
+    "dxf-parser": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "concurrently": "^8.0.0",
+    "electron": "^27.0.0",
+    "electron-builder": "^24.0.0",
+    "typescript": "^5.0.0"
+  },
+  "build": {
+    "appId": "com.dwgviewer.app",
+    "productName": "DWG Viewer",
+    "compression": "maximum",
+    "electronLanguages": [
+      "en-US"
+    ],
+    "files": [
+      "dist/**/*",
+      "public/**/*",
+      "preload.js",
+      "package.json",
+      "!**/*.map"
+    ],
+    "asarUnpack": [
+      "node_modules/@mlightcad/libdxfrw-web/dist/libdxfrw.wasm",
+      "node_modules/@mlightcad/libredwg-web/wasm/**/*"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    }
+  }
+}
