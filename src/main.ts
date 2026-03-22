@@ -2,16 +2,45 @@ import { app, BrowserWindow, Menu, ipcMain, dialog } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
 
-// Disable GPU to prevent crashes
-app.disableHardwareAcceleration();
-
 // Force runtime/cache paths to a writable temp location.
 // This avoids Chromium cache permission errors on restricted profiles.
 const runtimeRoot = path.join(app.getPath('temp'), 'dwl-viewer-runtime');
 const runtimeUserData = path.join(runtimeRoot, 'userData');
 const runtimeSessionData = path.join(runtimeRoot, 'sessionData');
+const settingsPath = path.join(runtimeRoot, 'settings.json');
 fs.mkdirSync(runtimeUserData, { recursive: true });
 fs.mkdirSync(runtimeSessionData, { recursive: true });
+
+type AppSettings = {
+  hardwareAcceleration: boolean;
+};
+
+const DEFAULT_SETTINGS: AppSettings = {
+  hardwareAcceleration: false
+};
+
+function readAppSettings(): AppSettings {
+  try {
+    if (!fs.existsSync(settingsPath)) return { ...DEFAULT_SETTINGS };
+    const raw = fs.readFileSync(settingsPath, 'utf8');
+    const parsed = JSON.parse(raw) as Partial<AppSettings>;
+    return {
+      hardwareAcceleration: parsed.hardwareAcceleration !== false
+    };
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+
+function writeAppSettings(settings: AppSettings): void {
+  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
+}
+
+let appSettings = readAppSettings();
+if (!appSettings.hardwareAcceleration) {
+  app.disableHardwareAcceleration();
+}
+
 app.setPath('userData', runtimeUserData);
 app.setPath('sessionData', runtimeSessionData);
 app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
@@ -19,6 +48,7 @@ app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
 let mainWindow: BrowserWindow | null = null;
 let libdxfrwInstance: any = null;
 let libredwgInstance: any = null;
+let pendingOpenPath: string | null = null;
 
 type AutomationConfig = {
   enabled: boolean;
@@ -54,6 +84,17 @@ function readArgValue(flag: string): string | null {
   if (!raw) return null;
   // Support quoted paths: --auto-open="C:\\path\\file.dwg"
   return raw.replace(/^"|"$/g, '');
+}
+
+function resolveOpenPathFromArgv(argv: string[]): string | null {
+  for (const arg of argv) {
+    if (!arg || arg.startsWith('--')) continue;
+    const ext = path.extname(arg).toLowerCase();
+    if ((ext === '.dwg' || ext === '.dxf') && fs.existsSync(arg)) {
+      return path.resolve(arg);
+    }
+  }
+  return null;
 }
 
 const autoOpenArg = readArgValue('--auto-open');
@@ -145,6 +186,71 @@ function normalizeEntitiesForRenderer(entities: any[]): any[] {
   });
 }
 
+type EntitySpace = 'model' | 'paper' | 'unknown';
+
+function classifyBlockRecordSpace(name: unknown): EntitySpace {
+  const upper = String(name ?? '').toUpperCase();
+  if (upper.startsWith('*PAPER_SPACE')) return 'paper';
+  if (upper.startsWith('*MODEL_SPACE')) return 'model';
+  return 'unknown';
+}
+
+function buildOwnerSpaceMap(blockRecordEntries: any[]): Map<string, EntitySpace> {
+  const map = new Map<string, EntitySpace>();
+  for (const br of blockRecordEntries ?? []) {
+    const space = classifyBlockRecordSpace(br?.name);
+    if (space === 'unknown') continue;
+    const handle = br?.handle ?? br?.objectHandle ?? br?.id;
+    if (handle === undefined || handle === null) continue;
+    map.set(String(handle).toUpperCase(), space);
+  }
+  return map;
+}
+
+function annotateEntitySpace(entity: any, ownerSpaceByHandle: Map<string, EntitySpace>, inheritedSpace: EntitySpace = 'unknown'): void {
+  if (!entity || typeof entity !== 'object') return;
+
+  let resolved: EntitySpace = inheritedSpace;
+
+  const explicitBool = entity.paperSpace ?? entity.paperspace ?? entity.inPaperSpace ?? entity.isPaperSpace;
+  if (typeof explicitBool === 'boolean') {
+    resolved = explicitBool ? 'paper' : 'model';
+  }
+
+  if (resolved === 'unknown') {
+    const ownerHandle = entity.ownerBlockRecordSoftId ?? entity.ownerBlockRecordHandle ?? entity.ownerHandle;
+    if (ownerHandle !== undefined && ownerHandle !== null) {
+      const mapped = ownerSpaceByHandle.get(String(ownerHandle).toUpperCase());
+      if (mapped) resolved = mapped;
+    }
+  }
+
+  const explicitText = String(entity.entitySpace ?? '').toLowerCase();
+  if (explicitText.includes('paper')) resolved = 'paper';
+  if (explicitText.includes('model')) resolved = 'model';
+
+  if (resolved !== 'unknown') {
+    entity.entitySpace = resolved;
+    entity.isInPaperSpace = resolved === 'paper';
+  }
+
+  const nestedGroups = [entity.attribs, entity.attributes];
+  for (const group of nestedGroups) {
+    if (!Array.isArray(group)) continue;
+    for (const child of group) {
+      annotateEntitySpace(child, ownerSpaceByHandle, resolved);
+    }
+  }
+}
+
+function annotateEntitiesSpaceByOwner(entities: any[], blockRecordEntries: any[]): any[] {
+  const ownerSpaceByHandle = buildOwnerSpaceMap(blockRecordEntries);
+  for (const entity of entities ?? []) {
+    annotateEntitySpace(entity, ownerSpaceByHandle);
+  }
+  return entities;
+}
+
 function mapInsUnitsToLabel(insUnits: number): string {
   const unitMap: Record<number, string> = {
     0: 'Unitless',
@@ -176,9 +282,187 @@ function mapInsUnitsToLabel(insUnits: number): string {
   return unitMap[insUnits] ?? `INSUNITS ${insUnits}`;
 }
 
-function extractLayerTable(tables: any): Record<string, { color: number | null; hex: string | null; name: string; visible: boolean; linetype: string | null }> {
-  const result: Record<string, { color: number | null; hex: string | null; name: string; visible: boolean; linetype: string | null }> = {};
+type LayerMeta = {
+  color: number | null;
+  hex: string | null;
+  name: string;
+  visible: boolean;
+  linetype: string | null;
+  linetypePattern?: number[] | null;
+  lineweightMm?: number | null;
+};
+
+function extractDashElementLength(raw: any): number | null {
+  if (raw == null) return null;
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
+  if (typeof raw === 'string') {
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+  if (typeof raw === 'object') {
+    const candidates = [raw.length, raw.value, raw.segmentLength, raw.dashLength, raw.len];
+    for (const c of candidates) {
+      const n = Number(c);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
+function normalizeDashArray(raw: any): number[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out = raw
+    .map((v) => extractDashElementLength(v))
+    .filter((v): v is number => Number.isFinite(v))
+    .map((v) => Math.abs(v))
+    .filter((n) => n >= 0);
+  return out.length ? out : null;
+}
+
+function buildDxfLinetypePatternMap(tables: any): Record<string, number[] | null> {
+  const out: Record<string, number[] | null> = {};
+  const ltRoot = tables?.lineType ?? tables?.linetype ?? tables?.LTYPE ?? null;
+  if (!ltRoot) return out;
+  const defsObj = ltRoot.lineTypes ?? ltRoot.linetypes ?? ltRoot.entries ?? ltRoot;
+  const defs: any[] = Array.isArray(defsObj) ? defsObj : Object.values(defsObj);
+  for (const def of defs) {
+    const name = String(def?.name || '').trim();
+    if (!name) continue;
+    const pattern = normalizeDashArray(
+      def?.pattern ??
+      def?.elements ??
+      def?.segments ??
+      def?.dashes ??
+      def?.dashArray ??
+      def?.data
+    );
+    out[name.toUpperCase()] = pattern;
+  }
+  return out;
+}
+
+function buildDwgLinetypePatternMap(dwgDb: any): Record<string, number[] | null> {
+  const out: Record<string, number[] | null> = {};
+  const defs: any[] = dwgDb?.tables?.LTYPE?.entries ?? [];
+  for (const def of defs) {
+    const name = String(def?.name || '').trim();
+    if (!name) continue;
+    const pattern = normalizeDashArray(
+      def?.pattern ??
+      def?.dashes ??
+      def?.dashLengths ??
+      def?.elements ??
+      def?.segments ??
+      def?.lines ??
+      def?.data
+    );
+    out[name.toUpperCase()] = pattern;
+  }
+  return out;
+}
+
+function normalizeLineweightMm(raw: unknown): number | null {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  if (n <= 0) return null;
+  // CAD lineweights are typically stored as hundredths of a millimeter when the
+  // raw value is an integer code (for example 7 => 0.07 mm, 35 => 0.35 mm).
+  if (Number.isInteger(n) && n <= 211) return n / 100;
+  // Some parsers may already normalize to millimeters as floats (for example 0.35).
+  if (!Number.isInteger(n) && n < 10) return n;
+  return null;
+}
+
+function buildDwgLinetypeNameByHandleMap(dwgDb: any): Map<string, string> {
+  const map = new Map<string, string>();
+  const defs: any[] = dwgDb?.tables?.LTYPE?.entries ?? [];
+  for (const def of defs) {
+    const name = String(def?.name || '').trim();
+    if (!name) continue;
+    const candidates = [def?.handle, def?.objectHandle, def?.id];
+    for (const c of candidates) {
+      if (c === undefined || c === null) continue;
+      map.set(String(c).toUpperCase(), name);
+    }
+  }
+  return map;
+}
+
+function resolveEntityLinetypeName(entity: any, handleMap?: Map<string, string>): string | null {
+  if (!entity || typeof entity !== 'object') return null;
+  const rawName = entity.lineTypeName ?? entity.linetypeName ?? entity.linetype ?? entity.lineType ?? entity.ltype ?? null;
+  if (typeof rawName === 'string' && rawName.trim()) return rawName.trim();
+
+  const rawHandle = entity.linetypeHandle ?? entity.lineTypeHandle ?? entity.ltypeHandle ?? entity.linetypeId ?? null;
+  if (rawHandle !== null && rawHandle !== undefined && handleMap) {
+    return handleMap.get(String(rawHandle).toUpperCase()) ?? null;
+  }
+  return null;
+}
+
+function annotateEntityStyle(
+  entity: any,
+  linetypePatternByName: Record<string, number[] | null>,
+  linetypeHandleMap?: Map<string, string>
+): void {
+  if (!entity || typeof entity !== 'object') return;
+
+  const linetypeName = resolveEntityLinetypeName(entity, linetypeHandleMap);
+  if (linetypeName && !entity.lineTypeName) entity.lineTypeName = linetypeName;
+  if (linetypeName && !entity.linetypePattern) {
+    const pattern = linetypePatternByName[String(linetypeName).toUpperCase()] ?? null;
+    if (pattern) entity.linetypePattern = pattern;
+  }
+
+  if (!entity.lineweightMm) {
+    const lw = normalizeLineweightMm(
+      entity.lineweight ??
+      entity.lineWeight ??
+      entity.lWeight ??
+      entity.weight
+    );
+    if (lw) entity.lineweightMm = lw;
+  }
+
+  const nestedGroups = [entity.attribs, entity.attributes];
+  for (const group of nestedGroups) {
+    if (!Array.isArray(group)) continue;
+    for (const child of group) {
+      annotateEntityStyle(child, linetypePatternByName, linetypeHandleMap);
+    }
+  }
+}
+
+function annotateEntitiesStyle(
+  entities: any[],
+  linetypePatternByName: Record<string, number[] | null>,
+  linetypeHandleMap?: Map<string, string>
+): any[] {
+  for (const entity of entities ?? []) {
+    annotateEntityStyle(entity, linetypePatternByName, linetypeHandleMap);
+  }
+  return entities;
+}
+
+function annotateBlockMapStyles(
+  blocks: Record<string, any>,
+  linetypePatternByName: Record<string, number[] | null>,
+  linetypeHandleMap?: Map<string, string>
+): Record<string, any> {
+  for (const block of Object.values(blocks || {})) {
+    const entities = Array.isArray((block as any)?.entities)
+      ? (block as any).entities
+      : (Array.isArray((block as any)?.objects) ? (block as any).objects : null);
+    if (!entities) continue;
+    annotateEntitiesStyle(entities, linetypePatternByName, linetypeHandleMap);
+  }
+  return blocks;
+}
+
+function extractLayerTable(tables: any): Record<string, LayerMeta> {
+  const result: Record<string, LayerMeta> = {};
   if (!tables) return result;
+  const linetypePatterns = buildDxfLinetypePatternMap(tables);
   // dxf-parser stores layers at tables.layer.layers keyed by layer name
   const layerTable = tables.layer ?? tables.LAYER ?? null;
   if (!layerTable) return result;
@@ -210,13 +494,16 @@ function extractLayerTable(tables: any): Record<string, { color: number | null; 
     const linetype = typeof entry.lineTypeName === 'string'
       ? entry.lineTypeName
       : (typeof entry.linetype === 'string' ? entry.linetype : null);
-    result[name.toUpperCase()] = { color: colorIdx, hex, name, visible, linetype };
+    const linetypePattern = linetype ? (linetypePatterns[String(linetype).toUpperCase()] ?? null) : null;
+    const lineweightMm = normalizeLineweightMm(entry.lineweight ?? entry.lineWeight ?? entry.weight);
+    result[name.toUpperCase()] = { color: colorIdx, hex, name, visible, linetype, linetypePattern, lineweightMm };
   }
   return result;
 }
 
-function extractLayerTableFromDwgDb(dwgDb: any): Record<string, { color: number | null; hex: string | null; name: string; visible: boolean; linetype: string | null }> {
-  const result: Record<string, { color: number | null; hex: string | null; name: string; visible: boolean; linetype: string | null }> = {};
+function extractLayerTableFromDwgDb(dwgDb: any): Record<string, LayerMeta> {
+  const result: Record<string, LayerMeta> = {};
+  const linetypePatterns = buildDwgLinetypePatternMap(dwgDb);
   const entries: any[] = dwgDb?.tables?.LAYER?.entries ?? [];
   for (const entry of entries) {
     if (!entry || typeof entry !== 'object' || !entry.name) continue;
@@ -254,7 +541,9 @@ function extractLayerTableFromDwgDb(dwgDb: any): Record<string, { color: number 
       : (typeof entry.linetypeName === 'string'
         ? entry.linetypeName
         : (typeof entry.linetype === 'string' ? entry.linetype : null));
-    result[name.toUpperCase()] = { color: colorIdx, hex, name, visible, linetype };
+    const linetypePattern = linetype ? (linetypePatterns[String(linetype).toUpperCase()] ?? null) : null;
+    const lineweightMm = normalizeLineweightMm(entry.lineweight ?? entry.lineWeight ?? entry.weight);
+    result[name.toUpperCase()] = { color: colorIdx, hex, name, visible, linetype, linetypePattern, lineweightMm };
   }
   return result;
 }
@@ -352,7 +641,7 @@ type ParsePayload = {
   source: string;
   entities: any[];
   blocks: Record<string, any>;
-  layers: Record<string, { color: number | null; hex: string | null; name: string; visible: boolean; linetype: string | null }>;
+  layers: Record<string, LayerMeta>;
   units: { code: number | null; label: string };
   xrefs: XrefReference[];
 };
@@ -370,10 +659,12 @@ async function parseCadFileForReference(filePath: string): Promise<ParsePayload 
     const DxfParser = require('dxf-parser');
     const parser = new DxfParser();
     const dxf = parser.parseSync(content);
-    const blocks = ensureBlockMap(dxf.blocks);
+    const linetypePatternByName = buildDxfLinetypePatternMap(dxf.tables);
+    const blocks = annotateBlockMapStyles(ensureBlockMap(dxf.blocks), linetypePatternByName);
+    const entities = annotateEntitiesStyle(dxf.entities ?? [], linetypePatternByName);
     return {
       source: 'dxf-parser',
-      entities: dxf.entities ?? [],
+      entities,
       blocks,
       layers: extractLayerTable(dxf.tables),
       units: extractUnitsFromHeader(dxf.header),
@@ -390,13 +681,31 @@ async function parseCadFileForReference(filePath: string): Promise<ParsePayload 
     const { Dwg_File_Type } = require('@mlightcad/libredwg-web');
     const dwgData = libredwg.dwg_read_data(new Uint8Array(nodeBuffer), Dwg_File_Type.DWG);
     const dwgDb = libredwg.convert(dwgData);
-    const entities = normalizeEntitiesForRenderer(dwgDb?.entities ?? []);
+    const linetypePatternByName = buildDwgLinetypePatternMap(dwgDb);
+    const linetypeHandleMap = buildDwgLinetypeNameByHandleMap(dwgDb);
     const blockRecordEntries: any[] = dwgDb?.tables?.BLOCK_RECORD?.entries ?? [];
+    const entities = annotateEntitiesStyle(
+      annotateEntitiesSpaceByOwner(
+        normalizeEntitiesForRenderer(dwgDb?.entities ?? []),
+        blockRecordEntries
+      ),
+      linetypePatternByName,
+      linetypeHandleMap
+    );
     const blocks: Record<string, any> = {};
     for (const br of blockRecordEntries) {
       if (!br?.name) continue;
+      const blockSpace = classifyBlockRecordSpace(br.name);
+      const blockEntities = annotateEntitiesStyle(
+        normalizeEntitiesForRenderer(br.entities ?? []),
+        linetypePatternByName,
+        linetypeHandleMap
+      );
+      for (const blockEntity of blockEntities) {
+        annotateEntitySpace(blockEntity, new Map<string, EntitySpace>(), blockSpace);
+      }
       const blockPayload = {
-        entities: normalizeEntitiesForRenderer(br.entities ?? []),
+        entities: blockEntities,
         basePoint: br.basePoint ?? { x: 0, y: 0, z: 0 }
       };
       blocks[br.name] = blockPayload;
@@ -433,10 +742,12 @@ async function parseCadFileForReference(filePath: string): Promise<ParsePayload 
     const DxfParser = require('dxf-parser');
     const parser = new DxfParser();
     const dxfParsed = parser.parseSync(dxfContent);
-    const blocks = ensureBlockMap(dxfParsed.blocks);
+    const linetypePatternByName = buildDxfLinetypePatternMap(dxfParsed.tables);
+    const blocks = annotateBlockMapStyles(ensureBlockMap(dxfParsed.blocks), linetypePatternByName);
+    const entities = annotateEntitiesStyle(dxfParsed.entities ?? [], linetypePatternByName);
     return {
       source: 'libdxfrw-dxf',
-      entities: dxfParsed.entities ?? [],
+      entities,
       blocks,
       layers: extractLayerTable(dxfParsed.tables),
       units: extractUnitsFromHeader(dxfParsed.header),
@@ -597,6 +908,9 @@ function createWindow() {
     if (automationConfig.enabled && automationConfig.autoOpenPath) {
       console.log('[automation] auto-opening file:', automationConfig.autoOpenPath);
       mainWindow?.webContents.send('file-selected', automationConfig.autoOpenPath);
+    } else if (pendingOpenPath) {
+      mainWindow?.webContents.send('file-selected', pendingOpenPath);
+      pendingOpenPath = null;
     }
   });
 
@@ -608,6 +922,7 @@ function createWindow() {
 }
 
 function createMenu() {
+  const hwAccelChecked = !!appSettings.hardwareAcceleration;
   const template: Electron.MenuItemConstructorOptions[] = [
     {
       label: 'File',
@@ -630,15 +945,55 @@ function createMenu() {
             }
           }
         },
+        {
+          label: 'Print',
+          accelerator: 'CmdOrCtrl+P',
+          click: () => {
+            if (!mainWindow) return;
+            mainWindow.webContents.send('open-print-dialog');
+          }
+        },
+        {
+          label: 'Close File',
+          accelerator: 'CmdOrCtrl+W',
+          click: () => {
+            if (!mainWindow) return;
+            mainWindow.webContents.send('close-current-file');
+          }
+        },
         { type: 'separator' },
         { role: 'quit' }
       ]
     },
     {
-      label: 'Edit',
+      label: 'Settings',
       submenu: [
-        { role: 'undo' },
-        { role: 'redo' }
+        {
+          label: 'Hardware Acceleration',
+          type: 'checkbox',
+          checked: hwAccelChecked,
+          click: (menuItem) => {
+            const enabled = !!menuItem.checked;
+            if (enabled === appSettings.hardwareAcceleration) return;
+            appSettings = { ...appSettings, hardwareAcceleration: enabled };
+            writeAppSettings(appSettings);
+            dialog.showMessageBox({
+              type: 'info',
+              title: 'Restart Required',
+              message: 'Hardware acceleration change will apply after restart.',
+              buttons: ['Restart Now', 'Later'],
+              defaultId: 0,
+              cancelId: 1
+            }).then((result) => {
+              if (result.response === 0) {
+                app.relaunch();
+                app.exit(0);
+              }
+            }).catch(() => {
+              // Ignore prompt failures; setting is already persisted.
+            });
+          }
+        }
       ]
     },
     {
@@ -694,13 +1049,16 @@ ipcMain.handle('parse-file', async (_event, filePath: string) => {
       const dxf = parser.parseSync(content);
       const units = extractUnitsFromHeader(dxf.header);
       const layers = extractLayerTable(dxf.tables);
+      const linetypePatternByName = buildDxfLinetypePatternMap(dxf.tables);
+      const entities = annotateEntitiesStyle(dxf.entities ?? [], linetypePatternByName);
+      const blocks = annotateBlockMapStyles(ensureBlockMap(dxf.blocks), linetypePatternByName);
       let payload: ParsePayload = {
         source: 'dxf-parser',
-        entities: dxf.entities ?? [],
-        blocks: ensureBlockMap(dxf.blocks),
+        entities,
+        blocks,
         layers,
         units,
-        xrefs: dedupeXrefs(extractXrefsFromBlocks(dxf.blocks, filePath))
+        xrefs: dedupeXrefs(extractXrefsFromBlocks(blocks, filePath))
       };
       if (readerProfile.readExternalReferences) {
         payload = await mergeExternalReferences(filePath, payload);
@@ -740,14 +1098,32 @@ ipcMain.handle('parse-file', async (_event, filePath: string) => {
           console.log = originalLog;
         }
         const dwgDb = libredwg.convert(dwgData);
-        const entities = normalizeEntitiesForRenderer(dwgDb?.entities ?? []);
+        const linetypePatternByName = buildDwgLinetypePatternMap(dwgDb);
+        const linetypeHandleMap = buildDwgLinetypeNameByHandleMap(dwgDb);
+        const blockRecordEntries: any[] = dwgDb?.tables?.BLOCK_RECORD?.entries ?? [];
+        const entities = annotateEntitiesStyle(
+          annotateEntitiesSpaceByOwner(
+            normalizeEntitiesForRenderer(dwgDb?.entities ?? []),
+            blockRecordEntries
+          ),
+          linetypePatternByName,
+          linetypeHandleMap
+        );
         if (entities.length) {
-          const blockRecordEntries: any[] = dwgDb?.tables?.BLOCK_RECORD?.entries ?? [];
           const blocks: Record<string, any> = {};
           for (const br of blockRecordEntries) {
             if (!br?.name) continue;
+            const blockSpace = classifyBlockRecordSpace(br.name);
+            const blockEntities = annotateEntitiesStyle(
+              normalizeEntitiesForRenderer(br.entities ?? []),
+              linetypePatternByName,
+              linetypeHandleMap
+            );
+            for (const blockEntity of blockEntities) {
+              annotateEntitySpace(blockEntity, new Map<string, EntitySpace>(), blockSpace);
+            }
             const blockPayload = {
-              entities: normalizeEntitiesForRenderer(br.entities ?? []),
+              entities: blockEntities,
               basePoint: br.basePoint ?? { x: 0, y: 0, z: 0 }
             };
             blocks[br.name] = blockPayload;
@@ -809,13 +1185,16 @@ ipcMain.handle('parse-file', async (_event, filePath: string) => {
       const dxfParsed = parser.parseSync(dxfContent);
       const units = extractUnitsFromHeader(dxfParsed.header);
       const layers = extractLayerTable(dxfParsed.tables);
+      const linetypePatternByName = buildDxfLinetypePatternMap(dxfParsed.tables);
+      const entities = annotateEntitiesStyle(dxfParsed.entities ?? [], linetypePatternByName);
+      const blocks = annotateBlockMapStyles(ensureBlockMap(dxfParsed.blocks), linetypePatternByName);
       let payload: ParsePayload = {
         source: 'libdxfrw-dxf',
-        entities: dxfParsed.entities ?? [],
-        blocks: ensureBlockMap(dxfParsed.blocks),
+        entities,
+        blocks,
         layers,
         units,
-        xrefs: dedupeXrefs(extractXrefsFromBlocks(dxfParsed.blocks, filePath))
+        xrefs: dedupeXrefs(extractXrefsFromBlocks(blocks, filePath))
       };
       if (readerProfile.readExternalReferences) {
         payload = await mergeExternalReferences(filePath, payload);
@@ -853,6 +1232,51 @@ ipcMain.handle('request-open-file', async (event) => {
   return { success: false };
 });
 
+ipcMain.handle('get-hardware-acceleration', async () => {
+  return { enabled: !!appSettings.hardwareAcceleration };
+});
+
+ipcMain.handle('print-drawing', async (_event, settings: any) => {
+  if (!mainWindow) {
+    return { success: false, error: 'No active window to print.' };
+  }
+
+  const orientation = String(settings?.orientation || 'landscape').toLowerCase();
+  const pageSize = String(settings?.pageSize || 'Letter');
+  const marginInches = Math.max(0, Math.min(2, Number(settings?.marginInches ?? 0.25) || 0.25));
+  const printBackground = !!settings?.printBackground;
+  const color = !settings?.monochrome;
+  const css = `@page { size: ${pageSize} ${orientation}; margin: ${marginInches}in; }`;
+
+  let insertedCssKey: string | null = null;
+  try {
+    insertedCssKey = await mainWindow.webContents.insertCSS(css);
+    return await new Promise((resolve) => {
+      const options: any = {
+        printBackground,
+        landscape: orientation === 'landscape',
+        color,
+        pageSize
+      };
+      mainWindow?.webContents.print(options, (success, failureReason) => {
+        if (!success) {
+          resolve({ success: false, error: failureReason || 'Print cancelled or failed.' });
+          return;
+        }
+        resolve({ success: true });
+      });
+    });
+  } finally {
+    if (insertedCssKey) {
+      try {
+        await mainWindow.webContents.removeInsertedCSS(insertedCssKey);
+      } catch {
+        // Ignore CSS cleanup failure; it should not block printing.
+      }
+    }
+  }
+});
+
 ipcMain.handle('get-automation-config', async () => {
   return {
     enabled: automationConfig.enabled,
@@ -880,7 +1304,29 @@ ipcMain.handle('report-view-ready', async (_event, payload: any) => {
   }
 });
 
-app.whenReady().then(createWindow);
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  pendingOpenPath = resolveOpenPathFromArgv(process.argv);
+
+  app.on('second-instance', (_event, argv) => {
+    const nextPath = resolveOpenPathFromArgv(argv);
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+      if (nextPath) {
+        mainWindow.webContents.send('file-selected', nextPath);
+      }
+    } else if (nextPath) {
+      pendingOpenPath = nextPath;
+    }
+  });
+
+  app.whenReady().then(() => {
+    createWindow();
+  });
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

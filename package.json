@@ -47,8 +47,28 @@
     "directories": {
       "output": "release"
     },
+    "fileAssociations": [
+      {
+        "ext": "dwg",
+        "name": "AutoCAD Drawing",
+        "description": "DWG Drawing File",
+        "role": "Viewer"
+      },
+      {
+        "ext": "dxf",
+        "name": "Drawing Exchange Format",
+        "description": "DXF Drawing File",
+        "role": "Viewer"
+      }
+    ],
     "win": {
       "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
         {
           "target": "dir",
           "arch": [

@@ -30,6 +30,7 @@ let hoveredEntity = null;
 let nextEntityId = 1;
 let drawingUnitLabel = 'drawing units';
 let drawingUnitCode = null;
+let currentUnitConversion = 'default';
 let snapCache = [];
 let snapCacheDirty = true;
 let backgroundColor = '#ffffff';
@@ -42,6 +43,7 @@ let ignoredEntityTypes = new Set();
 let currentParseSource = 'unknown';
 let currentSpaceView = 'model';
 let parseCache = null;
+let entitySpatialIndex = null;
 let currentReaderProfile = {
   name: 'fidelity',
   readModelSpace: true,
@@ -55,6 +57,18 @@ let currentReaderProfile = {
 let redrawScheduled = false;
 let adaptedColorCache = new Map();
 let imageAssetCache = new Map();
+let printSettings = {
+  pageSize: 'Letter',
+  orientation: 'landscape',
+  fitMode: 'fit-page',
+  scalePercent: 100,
+  marginInches: 0.25,
+  monochrome: false,
+  printBackground: false,
+  showAnnotations: true,
+  showHatches: true
+};
+let printPreviewTimer = null;
 let resolveAutomationReady = null;
 const automationReady = new Promise((resolve) => {
   resolveAutomationReady = resolve;
@@ -95,6 +109,9 @@ document.addEventListener('DOMContentLoaded', () => {
     console.log('file selected via menu:', filePath);
     loadFile(filePath);
   });
+  window.electronAPI.onCloseCurrentFile(() => {
+    closeCurrentFile();
+  });
 });
 
 function initializeUI() {
@@ -129,6 +146,44 @@ function initializeUI() {
     console.log('open button clicked, requesting file dialog');
     const res = await window.electronAPI.requestOpenFile();
     console.log('dialog result', res);
+  });
+
+  document.getElementById('printBtn')?.addEventListener('click', async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    await requestPrint();
+  });
+
+  window.electronAPI.onOpenPrintDialog(() => {
+    requestPrint();
+  });
+
+  document.getElementById('printCancelBtn')?.addEventListener('click', () => {
+    closePrintModal();
+  });
+
+  document.getElementById('printConfirmBtn')?.addEventListener('click', async () => {
+    await runPrintWorkflow();
+  });
+
+  document.getElementById('printModal')?.addEventListener('click', (e) => {
+    if (e.target?.id === 'printModal') closePrintModal();
+  });
+
+  [
+    'printPageSize',
+    'printOrientation',
+    'printFitMode',
+    'printScale',
+    'printMarginInches',
+    'printMonochrome',
+    'printBackground',
+    'printAnnotations',
+    'printHatches'
+  ].forEach((id) => {
+    const node = document.getElementById(id);
+    node?.addEventListener('input', schedulePrintPreview);
+    node?.addEventListener('change', schedulePrintPreview);
   });
 
   document.getElementById('zoomInBtn')?.addEventListener('click', () => {
@@ -201,6 +256,12 @@ function initializeUI() {
     reprocessCachedDrawing();
   });
 
+  const unitSelect = document.getElementById('unitsConversionSelect');
+  unitSelect?.addEventListener('change', (e) => {
+    currentUnitConversion = String(e.target.value || 'default').toLowerCase();
+    redraw();
+  });
+
   // Canvas mouse handlers
   canvas.addEventListener('mousedown', handleCanvasMouseDown);
   canvas.addEventListener('mousemove', handleCanvasMouseMove);
@@ -218,7 +279,10 @@ function initializeUI() {
 
   // Keyboard shortcuts
   document.addEventListener('keydown', (e) => {
-    if (e.ctrlKey && e.key === '+') {
+    if (e.ctrlKey && e.key.toLowerCase() === 'p') {
+      e.preventDefault();
+      requestPrint();
+    } else if (e.ctrlKey && e.key === '+') {
       zoomAt(viewportWidth / 2, viewportHeight / 2, 1.1);
     } else if (e.ctrlKey && e.key === '-') {
       zoomAt(viewportWidth / 2, viewportHeight / 2, 1 / 1.1);
@@ -230,6 +294,327 @@ function initializeUI() {
       redraw();
     }
   });
+}
+
+function getPrintModalElements() {
+  return {
+    modal: document.getElementById('printModal'),
+    pageSize: document.getElementById('printPageSize'),
+    orientation: document.getElementById('printOrientation'),
+    fitMode: document.getElementById('printFitMode'),
+    scale: document.getElementById('printScale'),
+    marginInches: document.getElementById('printMarginInches'),
+    monochrome: document.getElementById('printMonochrome'),
+    printBackground: document.getElementById('printBackground'),
+    annotations: document.getElementById('printAnnotations'),
+    hatches: document.getElementById('printHatches'),
+    previewCanvas: document.getElementById('printPreviewCanvas'),
+    previewSummary: document.getElementById('printPreviewSummary')
+  };
+}
+
+function hasLoadedDrawing() {
+  return Array.isArray(entities) && entities.length > 0 && Number.isFinite(bounds?.minX) && Number.isFinite(bounds?.maxX);
+}
+
+function canOpenPrintModal() {
+  const el = getPrintModalElements();
+  return !!(
+    el.modal &&
+    el.pageSize &&
+    el.orientation &&
+    el.fitMode &&
+    el.scale &&
+    el.marginInches &&
+    el.monochrome &&
+    el.printBackground &&
+    el.annotations &&
+    el.hatches &&
+    el.previewCanvas &&
+    el.previewSummary
+  );
+}
+
+function getPrintPageDimensions(settings) {
+  const rawMap = {
+    Letter: { w: 11, h: 8.5 },
+    Legal: { w: 14, h: 8.5 },
+    Tabloid: { w: 17, h: 11 },
+    A4: { w: 11.69, h: 8.27 },
+    A3: { w: 16.54, h: 11.69 }
+  };
+  const raw = rawMap[String(settings?.pageSize || 'Letter')] || rawMap.Letter;
+  const orientation = String(settings?.orientation || 'landscape').toLowerCase();
+  return orientation === 'portrait'
+    ? { w: Math.min(raw.w, raw.h), h: Math.max(raw.w, raw.h) }
+    : { w: Math.max(raw.w, raw.h), h: Math.min(raw.w, raw.h) };
+}
+
+function captureRenderState() {
+  return {
+    currentZoom,
+    panX,
+    panY,
+    backgroundColor,
+    showEntityColors,
+    showAnnotations,
+    showHatches
+  };
+}
+
+function restoreRenderState(state) {
+  currentZoom = state.currentZoom;
+  panX = state.panX;
+  panY = state.panY;
+  backgroundColor = state.backgroundColor;
+  showEntityColors = state.showEntityColors;
+  showAnnotations = state.showAnnotations;
+  showHatches = state.showHatches;
+  clearRenderCaches();
+}
+
+function applyPrintRenderState(settings, options = {}) {
+  const page = getPrintPageDimensions(settings);
+  showAnnotations = settings.showAnnotations;
+  showHatches = settings.showHatches;
+  showEntityColors = settings.monochrome ? false : true;
+  backgroundColor = settings.printBackground ? backgroundColor : '#ffffff';
+  clearRenderCaches();
+
+  if (settings.fitMode === 'fit-page' || settings.fitMode === 'fit-width') {
+    const marginRatio = Math.min(0.35, (settings.marginInches / Math.max(page.w, page.h)) * 2.2);
+    fitToViewWithOptions({
+      fitMode: settings.fitMode,
+      marginRatio,
+      scalePercent: settings.scalePercent,
+      redraw: options.redraw !== false
+    });
+  } else {
+    currentZoom = options.baseZoom
+      ? options.baseZoom * (settings.scalePercent / 100)
+      : currentZoom * (settings.scalePercent / 100);
+    if (options.redraw !== false) redraw();
+  }
+}
+
+function configureCanvasSurface(targetCanvas, logicalWidth, logicalHeight) {
+  const dpr = window.devicePixelRatio || 1;
+  targetCanvas.width = Math.max(1, Math.floor(logicalWidth * dpr));
+  targetCanvas.height = Math.max(1, Math.floor(logicalHeight * dpr));
+  const targetCtx = targetCanvas.getContext('2d');
+  targetCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { targetCtx, dpr };
+}
+
+function renderPreparedSceneToCanvas(targetCanvas, logicalWidth, logicalHeight, settings) {
+  const savedGlobals = {
+    canvas,
+    ctx,
+    viewportWidth,
+    viewportHeight,
+    state: captureRenderState()
+  };
+
+  try {
+    const { targetCtx } = configureCanvasSurface(targetCanvas, logicalWidth, logicalHeight);
+    canvas = targetCanvas;
+    ctx = targetCtx;
+    viewportWidth = logicalWidth;
+    viewportHeight = logicalHeight;
+    applyPrintRenderState(settings, { redraw: false, baseZoom: savedGlobals.state.currentZoom });
+    renderFrame();
+  } finally {
+    canvas = savedGlobals.canvas;
+    ctx = savedGlobals.ctx;
+    viewportWidth = savedGlobals.viewportWidth;
+    viewportHeight = savedGlobals.viewportHeight;
+    restoreRenderState(savedGlobals.state);
+  }
+}
+
+function drawPrintPreview() {
+  const el = getPrintModalElements();
+  if (!el.previewCanvas || !el.previewSummary) return;
+  if (!hasLoadedDrawing()) {
+    el.previewSummary.textContent = 'Load a drawing to preview printing.';
+    return;
+  }
+
+  const settings = readPrintSettingsFromModal();
+  const rect = el.previewCanvas.getBoundingClientRect();
+  const previewWidth = Math.max(280, Math.floor(rect.width || 480));
+  const previewHeight = Math.max(220, Math.floor(rect.height || 280));
+  const { targetCtx } = configureCanvasSurface(el.previewCanvas, previewWidth, previewHeight);
+
+  targetCtx.clearRect(0, 0, previewWidth, previewHeight);
+  targetCtx.fillStyle = '#dfe6ec';
+  targetCtx.fillRect(0, 0, previewWidth, previewHeight);
+
+  const page = getPrintPageDimensions(settings);
+  const pageAspect = page.w / page.h;
+  const outerPad = 18;
+  let pageW = previewWidth - outerPad * 2;
+  let pageH = pageW / pageAspect;
+  if (pageH > previewHeight - outerPad * 2) {
+    pageH = previewHeight - outerPad * 2;
+    pageW = pageH * pageAspect;
+  }
+
+  const pageX = (previewWidth - pageW) / 2;
+  const pageY = (previewHeight - pageH) / 2;
+  const marginX = pageW * (settings.marginInches / page.w);
+  const marginY = pageH * (settings.marginInches / page.h);
+  const innerX = pageX + marginX;
+  const innerY = pageY + marginY;
+  const innerW = Math.max(20, pageW - marginX * 2);
+  const innerH = Math.max(20, pageH - marginY * 2);
+
+  targetCtx.save();
+  targetCtx.shadowColor = 'rgba(0,0,0,0.18)';
+  targetCtx.shadowBlur = 14;
+  targetCtx.shadowOffsetY = 5;
+  targetCtx.fillStyle = '#ffffff';
+  targetCtx.fillRect(pageX, pageY, pageW, pageH);
+  targetCtx.restore();
+
+  targetCtx.strokeStyle = '#9aa9b5';
+  targetCtx.lineWidth = 1;
+  targetCtx.strokeRect(pageX + 0.5, pageY + 0.5, pageW - 1, pageH - 1);
+  targetCtx.setLineDash([5, 4]);
+  targetCtx.strokeStyle = '#c3ced8';
+  targetCtx.strokeRect(innerX + 0.5, innerY + 0.5, innerW - 1, innerH - 1);
+  targetCtx.setLineDash([]);
+
+  const sceneCanvas = document.createElement('canvas');
+  renderPreparedSceneToCanvas(sceneCanvas, Math.max(20, Math.floor(innerW)), Math.max(20, Math.floor(innerH)), settings);
+  targetCtx.drawImage(sceneCanvas, innerX, innerY, innerW, innerH);
+
+  el.previewSummary.textContent = `${settings.pageSize} ${settings.orientation}, ${settings.fitMode.replace('-', ' ')}, scale ${settings.scalePercent}%, margin ${settings.marginInches}in`;
+}
+
+function schedulePrintPreview() {
+  if (printPreviewTimer) clearTimeout(printPreviewTimer);
+  printPreviewTimer = setTimeout(() => {
+    const modal = document.getElementById('printModal');
+    if (!modal || !modal.classList.contains('open')) return;
+    drawPrintPreview();
+  }, 20);
+}
+
+function syncPrintModalFromState() {
+  const el = getPrintModalElements();
+  if (!el.modal) return;
+  el.pageSize.value = printSettings.pageSize;
+  el.orientation.value = printSettings.orientation;
+  el.fitMode.value = printSettings.fitMode;
+  el.scale.value = String(printSettings.scalePercent);
+  el.marginInches.value = String(printSettings.marginInches);
+  el.monochrome.checked = !!printSettings.monochrome;
+  el.printBackground.checked = !!printSettings.printBackground;
+  el.annotations.checked = !!printSettings.showAnnotations;
+  el.hatches.checked = !!printSettings.showHatches;
+}
+
+function readPrintSettingsFromModal() {
+  const el = getPrintModalElements();
+  return {
+    pageSize: String(el.pageSize.value || 'Letter'),
+    orientation: String(el.orientation.value || 'landscape'),
+    fitMode: String(el.fitMode.value || 'fit-page'),
+    scalePercent: Math.max(10, Math.min(400, Number(el.scale.value || 100) || 100)),
+    marginInches: Math.max(0, Math.min(2, Number(el.marginInches.value || 0.25) || 0.25)),
+    monochrome: !!el.monochrome.checked,
+    printBackground: !!el.printBackground.checked,
+    showAnnotations: !!el.annotations.checked,
+    showHatches: !!el.hatches.checked
+  };
+}
+
+function openPrintModal() {
+  const modal = document.getElementById('printModal');
+  if (!modal) return;
+  syncPrintModalFromState();
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+  schedulePrintPreview();
+}
+
+function closePrintModal() {
+  const modal = document.getElementById('printModal');
+  if (!modal) return;
+  if (printPreviewTimer) {
+    clearTimeout(printPreviewTimer);
+    printPreviewTimer = null;
+  }
+  modal.classList.remove('open');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+function fitToViewWithOptions(options = {}) {
+  const width = bounds.maxX - bounds.minX;
+  const height = bounds.maxY - bounds.minY;
+  if (viewportWidth <= 0 || viewportHeight <= 0 || width <= 0 || height <= 0) return;
+
+  const fitMode = String(options.fitMode || 'fit-page');
+  const marginRatio = Math.max(0, Math.min(0.35, Number(options.marginRatio ?? 0.05) || 0.05));
+  const scalePercent = Math.max(10, Math.min(400, Number(options.scalePercent ?? 100) || 100));
+  const availW = Math.max(1, viewportWidth * (1 - marginRatio * 2));
+  const availH = Math.max(1, viewportHeight * (1 - marginRatio * 2));
+  const scaleX = availW / width;
+  const scaleY = availH / height;
+  const baseZoom = fitMode === 'fit-width' ? scaleX : Math.min(scaleX, scaleY);
+
+  currentZoom = baseZoom * (scalePercent / 100);
+  const cx = (bounds.minX + bounds.maxX) / 2;
+  const cy = (bounds.minY + bounds.maxY) / 2;
+  panX = viewportWidth / 2 - cx * currentZoom;
+  panY = viewportHeight / 2 + cy * currentZoom;
+  if (options.redraw !== false) redraw();
+}
+
+function nextFrame() {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+async function runPrintWorkflow() {
+  printSettings = readPrintSettingsFromModal();
+  closePrintModal();
+
+  const savedState = captureRenderState();
+
+  try {
+    applyPrintRenderState(printSettings, { redraw: true, baseZoom: savedState.currentZoom });
+
+    await nextFrame();
+    const result = await window.electronAPI.printDrawing(printSettings);
+    if (!result?.success && result?.error) {
+      showError(`Print failed: ${result.error}`);
+    }
+  } finally {
+    restoreRenderState(savedState);
+    redraw();
+  }
+}
+
+async function requestPrint() {
+  if (!hasLoadedDrawing()) {
+    showError('Load a drawing before printing.');
+    return;
+  }
+
+  if (canOpenPrintModal()) {
+    openPrintModal();
+    return;
+  }
+
+  try {
+    const result = await window.electronAPI.printDrawing(printSettings);
+    if (!result?.success) {
+      showError(`Print failed: ${result?.error || 'Unknown print error.'}`);
+    }
+  } catch (error) {
+    showError(`Print failed: ${error?.message || error}`);
+  }
 }
 
 function applyMarqueeZoom(startScreen, endScreen) {
@@ -291,6 +676,16 @@ function angleToRadians(value, unit = 'rad') {
   const n = Number(value);
   if (!Number.isFinite(n)) return 0;
   return unit === 'deg' ? toRadians(n) : n;
+}
+
+function inferAngleRadians(value, unitHint = null, preferDegrees = true) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  const unit = String(unitHint || '').toLowerCase();
+  if (unit.includes('deg')) return toRadians(n);
+  if (unit.includes('rad')) return n;
+  if (Math.abs(n) > Math.PI * 2 + 0.01) return toRadians(n);
+  return preferDegrees ? toRadians(n) : n;
 }
 
 function normalizeAngleUnit(entity, source, startRaw, endRaw) {
@@ -440,6 +835,59 @@ function layerLinetype(layerName) {
   return layerColorMap[key]?.linetype || null;
 }
 
+function layerLinetypePattern(layerName) {
+  if (!layerName) return null;
+  const key = layerName.toUpperCase();
+  const raw = layerColorMap[key]?.linetypePattern;
+  if (!Array.isArray(raw)) return null;
+  const out = raw
+    .map((v) => Math.abs(Number(v)))
+    .filter((n) => Number.isFinite(n) && n > 1e-6);
+  return out.length ? out : null;
+}
+
+function layerLineweightMm(layerName) {
+  if (!layerName) return null;
+  const key = layerName.toUpperCase();
+  const raw = layerColorMap[key]?.lineweightMm;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function normalizeLinetypeName(raw) {
+  if (raw == null) return null;
+  if (typeof raw === 'object') {
+    const objName = raw.name || raw.lineTypeName || raw.linetypeName || raw.value || null;
+    if (objName != null) return normalizeLinetypeName(objName);
+  }
+  const name = String(raw).trim();
+  if (!name) return null;
+  return name.toUpperCase();
+}
+
+function resolveLinetypeName(entityLinetype, layerName) {
+  const ent = normalizeLinetypeName(entityLinetype);
+  if (!ent || ent === 'BYLAYER' || ent === 'BYBLOCK') {
+    return normalizeLinetypeName(layerLinetype(layerName)) || 'CONTINUOUS';
+  }
+  return ent;
+}
+
+function normalizeDashPattern(raw) {
+  if (!Array.isArray(raw)) return null;
+  const out = raw
+    .map((v) => {
+      if (v != null && typeof v === 'object') {
+        const m = Number(v.length ?? v.value ?? v.segmentLength ?? v.dashLength ?? v.len ?? NaN);
+        return Number.isFinite(m) ? Math.abs(m) : NaN;
+      }
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.abs(n) : NaN;
+    })
+    .filter((n) => Number.isFinite(n) && n >= 0);
+  return out.length ? out : null;
+}
+
 function linetypeDashPattern(name) {
   const n = String(name || '').toUpperCase();
   if (!n || n === 'CONTINUOUS' || n === 'BYLAYER' || n === 'BYBLOCK') return [];
@@ -448,6 +896,68 @@ function linetypeDashPattern(name) {
   if (n.includes('CENTER')) return [10, 4, 2, 4];
   if (n.includes('PHANTOM')) return [12, 4, 2, 4, 2, 4];
   return [];
+}
+
+function resolveEntityDashPattern(entity) {
+  const explicit = normalizeDashPattern(
+    entity?.linetypePattern ??
+    entity?.lineTypePattern ??
+    entity?.dashPattern ??
+    entity?.pattern
+  );
+  if (explicit && explicit.length) return explicit;
+
+  const layerPattern = layerLinetypePattern(entity?.layer);
+  if (layerPattern && layerPattern.length) return layerPattern;
+
+  const resolvedName = resolveLinetypeName(
+    entity?.linetype ?? entity?.lineTypeName ?? entity?.lineType ?? entity?.ltype,
+    entity?.layer
+  );
+  return linetypeDashPattern(resolvedName);
+}
+
+function resolveEntityLinetypeScale(entity) {
+  const n = Number(
+    entity?.linetypeScale ??
+    entity?.lineTypeScale ??
+    entity?.ltscale ??
+    entity?.ltScale ??
+    1
+  );
+  return Number.isFinite(n) && n > 1e-6 ? n : 1;
+}
+
+function resolveEntityLineweightMm(entity) {
+  const raw = entity?.lineweightMm ?? entity?.lineweight ?? entity?.lineWeight ?? entity?.weight ?? null;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 0) {
+    if (Number.isInteger(n) && n <= 211) return n / 100;
+    if (!Number.isInteger(n) && n < 10) return n;
+  }
+  return layerLineweightMm(entity?.layer);
+}
+
+function strokeWidthFromEntity(entity, isSelected) {
+  const mm = resolveEntityLineweightMm(entity);
+  const base = mm ? Math.max(1, Math.min(8, mm * 96 / 25.4)) : 1;
+  return isSelected ? Math.max(2, base + 1) : base;
+}
+
+function scaleDashPatternForScreen(pattern, linetypeScale) {
+  if (!Array.isArray(pattern) || pattern.length === 0) return [];
+  const ltScale = Number.isFinite(linetypeScale) && linetypeScale > 1e-6 ? linetypeScale : 1;
+  const pxPerUnit = Number.isFinite(currentZoom) && currentZoom > 1e-6 ? currentZoom : 1;
+  const scale = Math.max(0.5, Math.min(400, pxPerUnit * ltScale));
+  const out = pattern
+    .map((v) => {
+      const n = Math.abs(Number(v));
+      if (!Number.isFinite(n)) return NaN;
+      if (n < 1e-9) return Math.max(0.8, scale * 0.12);
+      return Math.max(0.8, n * scale);
+    })
+    .filter((v) => Number.isFinite(v) && v > 0.2);
+  return out.length ? out : [];
 }
 
 function renderLayerPanel() {
@@ -459,11 +969,12 @@ function renderLayerPanel() {
     return;
   }
 
+  const resetBtn = `<button id="resetLayerColorsBtn" style="width:100%; padding:6px 8px; margin-bottom:8px; background:#3498db; color:white; border:1px solid #2980b9; border-radius:4px; cursor:pointer; font-size:12px; font-weight:500;">Reset to Default Colors</button>`;
+  
   const rows = entries.map(([key, meta]) => {
     const ov = layerOverrides[key] || {};
     const visible = typeof ov.visible === 'boolean' ? ov.visible : (meta.visible !== false);
     const color = ov.color || meta.hex || aciToHex(meta.color) || '#000000';
-    const linetype = String(ov.linetype || meta.linetype || 'CONTINUOUS').toUpperCase();
     return `
       <div class="property-item" style="display:block; border-bottom:1px solid #eef2f5; padding:6px 0;">
         <div style="display:flex; justify-content:space-between; gap:6px; align-items:center;">
@@ -473,19 +984,11 @@ function renderLayerPanel() {
           </label>
           <input type="color" class="property-input" data-layer-color="${key}" value="${color}" style="width:42px; padding:0; border:none; background:none;">
         </div>
-        <div style="margin-top:6px; display:flex; justify-content:flex-end;">
-          <select class="property-input" data-layer-linetype="${key}" style="width:118px;">
-            <option value="CONTINUOUS" ${linetype === 'CONTINUOUS' ? 'selected' : ''}>Continuous</option>
-            <option value="DASHED" ${linetype === 'DASHED' ? 'selected' : ''}>Dashed</option>
-            <option value="DOTTED" ${linetype === 'DOTTED' ? 'selected' : ''}>Dotted</option>
-            <option value="CENTER" ${linetype === 'CENTER' ? 'selected' : ''}>Center</option>
-          </select>
-        </div>
       </div>
     `;
   }).join('');
 
-  panel.innerHTML = rows;
+  panel.innerHTML = resetBtn + rows;
 
   panel.querySelectorAll('[data-layer-visible]').forEach((el) => {
     el.addEventListener('change', (ev) => {
@@ -505,14 +1008,17 @@ function renderLayerPanel() {
     });
   });
 
-  panel.querySelectorAll('[data-layer-linetype]').forEach((el) => {
-    el.addEventListener('change', (ev) => {
-      const layer = ev.target.getAttribute('data-layer-linetype');
-      if (!layer) return;
-      layerOverrides[layer] = { ...(layerOverrides[layer] || {}), linetype: String(ev.target.value || 'CONTINUOUS').toUpperCase() };
+  const resetBtn2 = document.getElementById('resetLayerColorsBtn');
+  if (resetBtn2) {
+    resetBtn2.addEventListener('click', () => {
+      for (const layer of Object.keys(layerColorMap || {})) {
+        layerOverrides[layer] = { ...(layerOverrides[layer] || {}), color: undefined };
+        delete layerOverrides[layer].color;
+      }
+      renderLayerPanel();
       redraw();
     });
-  });
+  }
 }
 
 function intColorToHex(v) {
@@ -926,33 +1432,220 @@ function getLineAngleDeg(entity) {
   return Math.atan2(entity.y2 - entity.y1, entity.x2 - entity.x1) * 180 / Math.PI;
 }
 
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatTooltipNumber(value, digits = 4) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  if (Math.abs(n) >= 1000 || (Math.abs(n) > 0 && Math.abs(n) < 0.0001)) {
+    return n.toExponential(3);
+  }
+  return n.toFixed(digits).replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
+}
+
+function isPointLike(value) {
+  return !!value && typeof value === 'object' && Number.isFinite(value.x) && Number.isFinite(value.y);
+}
+
+function formatPointLike(value) {
+  if (!isPointLike(value)) return null;
+  const parts = [formatTooltipNumber(value.x), formatTooltipNumber(value.y)];
+  if (Number.isFinite(value.z)) parts.push(formatTooltipNumber(value.z));
+  return `(${parts.join(', ')})`;
+}
+
+function formatEntityPropValue(key, value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') {
+    if (key.toLowerCase().includes('rotation') || key.toLowerCase().includes('angle')) {
+      return `${(Number(value) * 180 / Math.PI).toFixed(2)}°`;
+    }
+    if (key.toLowerCase().includes('color') && Number.isFinite(value)) {
+      return String(value);
+    }
+    return formatTooltipNumber(value);
+  }
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if (typeof value === 'string') return value.length > 160 ? `${value.slice(0, 157)}...` : value;
+  if (Array.isArray(value)) {
+    if (value.length === 0) return '[]';
+    if (value.every((v) => typeof v === 'number')) {
+      return `[${value.map((v) => formatTooltipNumber(v, 3) ?? String(v)).join(', ')}]`;
+    }
+    if (value.every((v) => isPointLike(v))) {
+      return `${value.length} points`;
+    }
+    return `${value.length} items`;
+  }
+  if (isPointLike(value)) return formatPointLike(value);
+  if (typeof value === 'object') {
+    const point = formatPointLike(value);
+    if (point) return point;
+    if (Number.isFinite(value.minX) && Number.isFinite(value.minY) && Number.isFinite(value.maxX) && Number.isFinite(value.maxY)) {
+      return `(${formatTooltipNumber(value.minX)}, ${formatTooltipNumber(value.minY)}) -> (${formatTooltipNumber(value.maxX)}, ${formatTooltipNumber(value.maxY)})`;
+    }
+    const keys = Object.keys(value);
+    return keys.length ? `{${keys.slice(0, 6).join(', ')}${keys.length > 6 ? ', ...' : ''}}` : '{}';
+  }
+  return String(value);
+}
+
+function pushEntityEntry(entries, label, value) {
+  if (value === null || value === undefined || value === '') return;
+  entries.push({ label, value: String(value) });
+}
+
+function appendEntityKeys(entries, entity, keys, seen) {
+  for (const key of keys) {
+    if (seen.has(key) || !(key in entity)) continue;
+    const formatted = formatEntityPropValue(key, entity[key]);
+    if (formatted === null || formatted === '') continue;
+    pushEntityEntry(entries, key, formatted);
+    seen.add(key);
+  }
+}
+
+function buildEntityPropertyEntries(entity) {
+  if (!entity) return [];
+  const ul = unitsLabel();
+  const entries = [];
+  const seen = new Set();
+  const push = (label, value) => pushEntityEntry(entries, label, value);
+
+  push('Type', String(entity.type || 'ENTITY').toUpperCase());
+  seen.add('type');
+
+  if (entity.layer) {
+    push('Layer', entity.layer);
+    seen.add('layer');
+  }
+
+  if (entity.entitySpace) {
+    push('Space', entity.entitySpace);
+    seen.add('entitySpace');
+  }
+
+  if (entity.color) {
+    push('Color', entity.color);
+    seen.add('color');
+  }
+  if (entity.linetype) {
+    push('Linetype', entity.linetype);
+    seen.add('linetype');
+  }
+  if (Array.isArray(entity.linetypePattern)) {
+    push('LinetypePattern', formatEntityPropValue('linetypePattern', entity.linetypePattern));
+    seen.add('linetypePattern');
+  }
+  if (Number.isFinite(entity.linetypeScale)) {
+    push('LinetypeScale', formatTooltipNumber(entity.linetypeScale));
+    seen.add('linetypeScale');
+  }
+  if (Number.isFinite(entity.lineweightMm)) {
+    push('Lineweight', `${formatTooltipNumber(entity.lineweightMm)} mm`);
+    seen.add('lineweightMm');
+  }
+
+  switch (entity.type) {
+    case 'line':
+    case 'dimension-line': {
+      push('Length', `${getEntityLineLength(entity).toFixed(4)} ${ul}`);
+      push('Angle', `${getLineAngleDeg(entity).toFixed(2)}°`);
+      appendEntityKeys(entries, entity, ['x1', 'y1', 'x2', 'y2'], seen);
+      break;
+    }
+    case 'circle': {
+      push('Center', formatPointLike({ x: entity.x, y: entity.y }));
+      push('Radius', `${formatTooltipNumber(entity.r)} ${ul}`);
+      push('Diameter', `${formatTooltipNumber(entity.r * 2)} ${ul}`);
+      push('Circumference', `${formatTooltipNumber(2 * Math.PI * entity.r)} ${ul}`);
+      appendEntityKeys(entries, entity, ['x', 'y', 'r'], seen);
+      break;
+    }
+    case 'arc': {
+      const span = arcSpanRadians(entity);
+      push('Center', formatPointLike({ x: entity.x, y: entity.y }));
+      push('Radius', `${formatTooltipNumber(entity.r)} ${ul}`);
+      push('Sweep', `${(span * 180 / Math.PI).toFixed(2)}°`);
+      push('ArcLength', `${formatTooltipNumber(entity.r * span)} ${ul}`);
+      appendEntityKeys(entries, entity, ['x', 'y', 'r', 'startAngle', 'endAngle', 'clockwise', 'angleUnit'], seen);
+      break;
+    }
+    case 'text':
+    case 'dimension': {
+      if (entity.text) push(entity.type === 'dimension' ? 'Value' : 'Text', `"${entity.text}"`);
+      if (Number.isFinite(entity.height)) push('Height', `${formatTooltipNumber(entity.height)} ${ul}`);
+      if (Number.isFinite(entity.rotation)) push('Rotation', `${(Number(entity.rotation) * 180 / Math.PI).toFixed(2)}°`);
+      appendEntityKeys(entries, entity, ['x', 'y', 'height', 'rotation', 'alignX', 'alignY', 'lineHeight'], seen);
+      break;
+    }
+    case 'hatch': {
+      if (entity.patternName) push('Pattern', entity.patternName);
+      if (Number.isFinite(entity.angle)) push('Angle', `${formatTooltipNumber(entity.angle)}°`);
+      if (Number.isFinite(entity.spacing)) push('Spacing', `${formatTooltipNumber(entity.spacing)} ${ul}`);
+      if (Array.isArray(entity.loops)) push('Loops', String(entity.loops.length));
+      break;
+    }
+    case 'image':
+    case 'underlay': {
+      if (entity.sourcePath) push('Source', entity.sourcePath);
+      if (entity.imageWidth && entity.imageHeight) push('Pixels', `${entity.imageWidth} x ${entity.imageHeight}`);
+      appendEntityKeys(entries, entity, ['x', 'y', 'w', 'h', 'rotation', 'kind'], seen);
+      break;
+    }
+    case 'filled-triangle': {
+      if (Array.isArray(entity.points)) push('Points', formatEntityPropValue('points', entity.points));
+      break;
+    }
+    default: {
+      appendEntityKeys(entries, entity, ['x', 'y', 'z', 'w', 'h', 'rotation'], seen);
+      break;
+    }
+  }
+
+  if (Number.isFinite(entity.minX) && Number.isFinite(entity.minY) && Number.isFinite(entity.maxX) && Number.isFinite(entity.maxY)) {
+    push('BBox', `(${formatTooltipNumber(entity.minX)}, ${formatTooltipNumber(entity.minY)}) -> (${formatTooltipNumber(entity.maxX)}, ${formatTooltipNumber(entity.maxY)})`);
+    seen.add('minX');
+    seen.add('minY');
+    seen.add('maxX');
+    seen.add('maxY');
+  }
+
+  appendEntityKeys(entries, entity, ['id', 'viewportClip'], seen);
+
+  const remainingKeys = Object.keys(entity)
+    .filter((key) => !seen.has(key))
+    .sort((a, b) => a.localeCompare(b));
+  appendEntityKeys(entries, entity, remainingKeys, seen);
+
+  return entries;
+}
+
+function renderEntityEntriesForSelection(entries) {
+  return entries.map((entry) => (
+    `<div class="property-item"><span class="property-label">${escapeHtml(entry.label)}:</span><span class="property-value">${escapeHtml(entry.value)}</span></div>`
+  )).join('');
+}
+
+function renderEntityEntriesForTooltip(entries) {
+  if (!entries.length) return '';
+  const [first, ...rest] = entries;
+  return [
+    `<span class="tt-type">${escapeHtml(first.value)}</span>`,
+    ...rest.map((entry) => _tooltipFmt(escapeHtml(entry.label), escapeHtml(entry.value)))
+  ].join('');
+}
+
 function getEntityInfoHtml(entity) {
   if (!entity) return '<div class="property-item"><span class="property-value">No selection</span></div>';
-  if (entity.type === 'line') {
-    return [
-      `<div class="property-item"><span class="property-label">Type:</span><span class="property-value">LINE</span></div>`,
-      `<div class="property-item"><span class="property-label">Length:</span><span class="property-value">${getEntityLineLength(entity).toFixed(4)} ${unitsLabel()}</span></div>`,
-      `<div class="property-item"><span class="property-label">Angle:</span><span class="property-value">${getLineAngleDeg(entity).toFixed(2)}°</span></div>`
-    ].join('');
-  }
-  if (entity.type === 'circle') {
-    return [
-      `<div class="property-item"><span class="property-label">Type:</span><span class="property-value">CIRCLE</span></div>`,
-      `<div class="property-item"><span class="property-label">Radius:</span><span class="property-value">${entity.r.toFixed(4)} ${unitsLabel()}</span></div>`,
-      `<div class="property-item"><span class="property-label">Diameter:</span><span class="property-value">${(entity.r * 2).toFixed(4)} ${unitsLabel()}</span></div>`,
-      `<div class="property-item"><span class="property-label">Circumference:</span><span class="property-value">${(2 * Math.PI * entity.r).toFixed(4)} ${unitsLabel()}</span></div>`
-    ].join('');
-  }
-  if (entity.type === 'arc') {
-    const span = arcSpanRadians(entity);
-    return [
-      `<div class="property-item"><span class="property-label">Type:</span><span class="property-value">ARC</span></div>`,
-      `<div class="property-item"><span class="property-label">Radius:</span><span class="property-value">${entity.r.toFixed(4)} ${unitsLabel()}</span></div>`,
-      `<div class="property-item"><span class="property-label">Arc Length:</span><span class="property-value">${(entity.r * span).toFixed(4)} ${unitsLabel()}</span></div>`,
-      `<div class="property-item"><span class="property-label">Sweep:</span><span class="property-value">${(span * 180 / Math.PI).toFixed(2)}°</span></div>`
-    ].join('');
-  }
-  return `<div class="property-item"><span class="property-label">Type:</span><span class="property-value">${entity.type}</span></div>`;
+  return renderEntityEntriesForSelection(buildEntityPropertyEntries(entity));
 }
 
 function updateSelectionPanel() {
@@ -986,81 +1679,7 @@ function _tooltipFmt(label, value) {
 
 function buildTooltipHTML(entity) {
   if (!entity) return '';
-  const ul = unitsLabel();
-  const lyr = entity.layer ? `<span class="tt-row"><span class="tt-label">Layer</span> ${entity.layer}</span>` : '';
-  const lines = [];
-
-  switch (entity.type) {
-    case 'line':
-    case 'dimension-line': {
-      const len = getEntityLineLength(entity);
-      const ang = getLineAngleDeg(entity);
-      lines.push(`<span class="tt-type">${entity.type === 'dimension-line' ? 'DIM LINE' : 'LINE'}</span>`);
-      lines.push(_tooltipFmt('Length', `${len.toFixed(4)} ${ul}`));
-      lines.push(_tooltipFmt('Angle', `${ang.toFixed(2)}°`));
-      break;
-    }
-    case 'circle':
-      lines.push(`<span class="tt-type">CIRCLE</span>`);
-      lines.push(_tooltipFmt('Radius', `${entity.r.toFixed(4)} ${ul}`));
-      lines.push(_tooltipFmt('Diameter', `${(entity.r * 2).toFixed(4)} ${ul}`));
-      break;
-    case 'arc': {
-      const span = arcSpanRadians(entity);
-      lines.push(`<span class="tt-type">ARC</span>`);
-      lines.push(_tooltipFmt('Radius', `${entity.r.toFixed(4)} ${ul}`));
-      lines.push(_tooltipFmt('Sweep', `${(span * 180 / Math.PI).toFixed(2)}°`));
-      lines.push(_tooltipFmt('Arc Length', `${(entity.r * span).toFixed(4)} ${ul}`));
-      break;
-    }
-    case 'text':
-      lines.push(`<span class="tt-type">TEXT</span>`);
-      if (entity.text) lines.push(_tooltipFmt('', `"${entity.text.slice(0, 60)}${entity.text.length > 60 ? '…' : ''}"`));
-      if (entity.height) lines.push(_tooltipFmt('Height', `${Number(entity.height).toFixed(4)} ${ul}`));
-      if (entity.rotation) lines.push(_tooltipFmt('Rotation', `${(Number(entity.rotation) * 180 / Math.PI).toFixed(2)}°`));
-      break;
-    case 'dimension':
-      lines.push(`<span class="tt-type">DIMENSION</span>`);
-      if (entity.text) lines.push(_tooltipFmt('Value', `"${entity.text.slice(0, 60)}${entity.text.length > 60 ? '…' : ''}"`));
-      if (entity.height) lines.push(_tooltipFmt('Height', `${Number(entity.height).toFixed(4)} ${ul}`));
-      break;
-    case 'hatch': {
-      lines.push(`<span class="tt-type">HATCH</span>`);
-      if (entity.patternName) lines.push(_tooltipFmt('Pattern', entity.patternName));
-      if (Number.isFinite(entity.minX)) {
-        const bba = ((entity.maxX - entity.minX) * (entity.maxY - entity.minY)).toFixed(2);
-        lines.push(_tooltipFmt('BBox Area', `~${bba} ${ul}²`));
-      }
-      if (Array.isArray(entity.loops) && entity.loops.length > 0)
-        lines.push(_tooltipFmt('Loops', String(entity.loops.length)));
-      break;
-    }
-    case 'image':
-      lines.push(`<span class="tt-type">IMAGE</span>`);
-      if (entity.sourcePath) lines.push(_tooltipFmt('File', entity.sourcePath.split(/[\\/]/).pop()));
-      if (entity.imageWidth && entity.imageHeight)
-        lines.push(_tooltipFmt('Pixels', `${entity.imageWidth} × ${entity.imageHeight}`));
-      if (Number.isFinite(entity.minX)) {
-        const iw = (entity.maxX - entity.minX).toFixed(4);
-        const ih = (entity.maxY - entity.minY).toFixed(4);
-        lines.push(_tooltipFmt('Size', `${iw} × ${ih} ${ul}`));
-      }
-      break;
-    case 'underlay':
-      lines.push(`<span class="tt-type">${String(entity.kind || 'UNDERLAY').toUpperCase()}</span>`);
-      if (entity.sourcePath) lines.push(_tooltipFmt('File', entity.sourcePath.split(/[\\/]/).pop()));
-      if (Number.isFinite(entity.minX)) {
-        const uw = (entity.maxX - entity.minX).toFixed(4);
-        const uh = (entity.maxY - entity.minY).toFixed(4);
-        lines.push(_tooltipFmt('Size', `${uw} × ${uh} ${ul}`));
-      }
-      break;
-    default:
-      lines.push(`<span class="tt-type">${String(entity.type || 'ENTITY').toUpperCase()}</span>`);
-  }
-
-  if (lyr) lines.push(lyr);
-  return lines.join('');
+  return renderEntityEntriesForTooltip(buildEntityPropertyEntries(entity));
 }
 
 function showTooltip(entity, clientX, clientY) {
@@ -1131,7 +1750,14 @@ function pickEntityAt(world) {
   let best = null;
   let bestDist = Infinity;
   const view = getWorldViewportBounds(24);
-  for (const ent of entities) {
+  const queryPad = Math.max(tol * 2, 1);
+  const candidates = queryEntitiesInBounds(
+    world.x - queryPad,
+    world.y - queryPad,
+    world.x + queryPad,
+    world.y + queryPad
+  );
+  for (const ent of candidates) {
     if (!isEntityVisible(ent, view)) continue;
     let d = Infinity;
     if (ent.type === 'line' || ent.type === 'dimension-line') {
@@ -1165,7 +1791,7 @@ function pickEntityAt(world) {
     const AREA_PRIO = { text: 0, dimension: 0, image: 1, underlay: 2, hatch: 3 };
     let areaPri = 9999;
     let areaSmallest = Infinity;
-    for (const ent of entities) {
+    for (const ent of candidates) {
       if (!isEntityVisible(ent, view)) continue;
       const pri = AREA_PRIO[ent.type];
       if (pri === undefined) continue;
@@ -1286,6 +1912,89 @@ function isEntityVisible(entity, view) {
   return !(maxX < view.minX || maxY < view.minY || minX > view.maxX || minY > view.maxY);
 }
 
+function bboxIntersects(entity, minX, minY, maxX, maxY) {
+  const eMinX = entity.minX ?? Number.NEGATIVE_INFINITY;
+  const eMinY = entity.minY ?? Number.NEGATIVE_INFINITY;
+  const eMaxX = entity.maxX ?? Number.POSITIVE_INFINITY;
+  const eMaxY = entity.maxY ?? Number.POSITIVE_INFINITY;
+  return !(eMaxX < minX || eMaxY < minY || eMinX > maxX || eMinY > maxY);
+}
+
+function rebuildEntitySpatialIndex() {
+  if (!Array.isArray(entities) || entities.length === 0) {
+    entitySpatialIndex = null;
+    return;
+  }
+
+  const width = Number(bounds?.maxX) - Number(bounds?.minX);
+  const height = Number(bounds?.maxY) - Number(bounds?.minY);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 1e-9 || height <= 1e-9) {
+    entitySpatialIndex = null;
+    return;
+  }
+
+  const targetCells = 120;
+  const cellSize = Math.max(1e-6, Math.sqrt((width * height) / targetCells));
+  const originX = Number(bounds.minX);
+  const originY = Number(bounds.minY);
+  const buckets = new Map();
+
+  for (const entity of entities) {
+    if (!Number.isFinite(entity?.minX) || !Number.isFinite(entity?.minY) || !Number.isFinite(entity?.maxX) || !Number.isFinite(entity?.maxY)) {
+      continue;
+    }
+    const ix0 = Math.floor((entity.minX - originX) / cellSize);
+    const iy0 = Math.floor((entity.minY - originY) / cellSize);
+    const ix1 = Math.floor((entity.maxX - originX) / cellSize);
+    const iy1 = Math.floor((entity.maxY - originY) / cellSize);
+
+    for (let ix = ix0; ix <= ix1; ix++) {
+      for (let iy = iy0; iy <= iy1; iy++) {
+        const key = `${ix}:${iy}`;
+        let arr = buckets.get(key);
+        if (!arr) {
+          arr = [];
+          buckets.set(key, arr);
+        }
+        arr.push(entity);
+      }
+    }
+  }
+
+  entitySpatialIndex = { originX, originY, cellSize, buckets };
+}
+
+function queryEntitiesInBounds(minX, minY, maxX, maxY) {
+  if (!entitySpatialIndex) return entities;
+  const { originX, originY, cellSize, buckets } = entitySpatialIndex;
+  const ix0 = Math.floor((minX - originX) / cellSize);
+  const iy0 = Math.floor((minY - originY) / cellSize);
+  const ix1 = Math.floor((maxX - originX) / cellSize);
+  const iy1 = Math.floor((maxY - originY) / cellSize);
+
+  const out = [];
+  const seen = new Set();
+  for (let ix = ix0; ix <= ix1; ix++) {
+    for (let iy = iy0; iy <= iy1; iy++) {
+      const arr = buckets.get(`${ix}:${iy}`);
+      if (!arr) continue;
+      for (const entity of arr) {
+        const id = entity?.id;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        if (bboxIntersects(entity, minX, minY, maxX, maxY)) {
+          out.push(entity);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function queryEntitiesInView(view) {
+  return queryEntitiesInBounds(view.minX, view.minY, view.maxX, view.maxY);
+}
+
 function setupDragDrop() {
   const dropZone = document.getElementById('dropZone');
   const canvasContainer = document.getElementById('canvasContainer');
@@ -1312,13 +2021,70 @@ function setupDragDrop() {
     const files = e.dataTransfer?.files;
     if (files && files.length > 0) {
       const file = files[0];
+      const filePath = file.path || '';
       const ext = file.name.split('.').pop()?.toLowerCase();
       if (ext === 'dwg' || ext === 'dxf') {
-        // Get file path from file name (limited in browser, use file API)
-        // For now, we'll need the user to use File -> Open dialog
+        if (!filePath) {
+          showError('Unable to read dropped file path. Use File -> Open as a fallback.');
+          return;
+        }
+        await loadFile(filePath);
+      } else {
+        showError('Unsupported file type. Please drop a DWG or DXF file.');
       }
     }
   });
+}
+
+function closeCurrentFile() {
+  entities = [];
+  bounds = { minX: 0, minY: 0, maxX: 100, maxY: 100 };
+  layerColorMap = {};
+  layerOverrides = {};
+  selectedEntityIds = [];
+  hoveredEntity = null;
+  activeSnap = null;
+  snapCache = [];
+  snapCacheDirty = true;
+  parseCache = null;
+  drawingUnitLabel = 'drawing units';
+  drawingUnitCode = null;
+  entitySpatialIndex = null;
+
+  const errorDiv = document.getElementById('errorDisplay');
+  if (errorDiv) {
+    errorDiv.style.display = 'none';
+    errorDiv.textContent = '';
+  }
+  const dz = document.getElementById('dropZone');
+  if (dz) {
+    dz.classList.remove('active');
+    dz.style.display = 'block';
+  }
+  if (canvas) {
+    canvas.style.display = 'none';
+  }
+
+  const fileInfo = document.getElementById('fileInfo');
+  if (fileInfo) fileInfo.textContent = 'No file loaded';
+  const format = document.getElementById('format');
+  if (format) format.textContent = '—';
+  const version = document.getElementById('version');
+  if (version) version.textContent = '—';
+  const size = document.getElementById('size');
+  if (size) size.textContent = '—';
+  const distance = document.getElementById('distance');
+  if (distance) distance.textContent = '—';
+  const angle = document.getElementById('angle');
+  if (angle) angle.textContent = '—';
+  const unitSelect = document.getElementById('unitsConversionSelect');
+  if (unitSelect) {
+    unitSelect.value = 'default';
+    currentUnitConversion = 'default';
+  }
+
+  updateSelectionPanel();
+  renderLayerPanel();
 }
 
 async function loadFile(filePath) {
@@ -1382,9 +2148,13 @@ async function loadFile(filePath) {
       );
     snapCacheDirty = true;
     drawingUnitLabel = parseResp?.units?.label || 'drawing units';
-    const unitsElem = document.getElementById('units');
-    if (unitsElem) unitsElem.textContent = drawingUnitLabel;
+    const unitSelect = document.getElementById('unitsConversionSelect');
+    if (unitSelect) {
+      unitSelect.value = 'default';
+      currentUnitConversion = 'default';
+    }
     bounds = calculateBounds(entities);
+    rebuildEntitySpatialIndex();
     const dElem = document.getElementById('distance');
     if (dElem) dElem.textContent = '—';
     const aElem = document.getElementById('angle');
@@ -1427,6 +2197,7 @@ function reprocessCachedDrawing() {
   );
   snapCacheDirty = true;
   bounds = calculateBounds(entities);
+  rebuildEntitySpatialIndex();
   updateSelectionPanel();
   fitToView();
   redraw();
@@ -1437,8 +2208,11 @@ function updateFileInfo(info) {
   document.getElementById('format').textContent = info.extension?.toUpperCase() || '—';
   document.getElementById('version').textContent = '—';
   document.getElementById('size').textContent = formatFileSize(info.size);
-  const unitsElem = document.getElementById('units');
-  if (unitsElem) unitsElem.textContent = 'Detecting...';
+  const unitSelect = document.getElementById('unitsConversionSelect');
+  if (unitSelect) {
+    unitSelect.value = 'default';
+    currentUnitConversion = 'default';
+  }
 }
 
 function formatFileSize(bytes) {
@@ -1507,9 +2281,9 @@ function renderFrame() {
   ctx.lineCap = 'butt';
   ctx.fillStyle = 'rgba(52, 152, 219, 0.1)';
   const view = getWorldViewportBounds(12);
+  const entitiesInView = queryEntitiesInView(view);
 
-  for (const entity of entities) {
-    if (!isEntityVisible(entity, view)) continue;
+  for (const entity of entitiesInView) {
     if (!isLayerVisible(entity.layer)) continue;
     if (entity.type !== 'hatch') continue;
     if (!showHatches) continue;
@@ -1533,8 +2307,7 @@ function renderFrame() {
     }
   }
 
-  for (const entity of entities) {
-    if (!isEntityVisible(entity, view)) continue;
+  for (const entity of entitiesInView) {
     if (!isLayerVisible(entity.layer)) continue;
     if (entity.type === 'hatch') continue;
     if (!showAnnotations && (entity.type === 'text' || entity.type === 'dimension')) continue;
@@ -1543,9 +2316,11 @@ function renderFrame() {
     const baseColor = getEffectiveEntityColor(entity, '#000000');
     ctx.strokeStyle = isSelected ? '#e67e22' : baseColor;
     ctx.fillStyle = isSelected ? '#e67e22' : baseColor;
-    ctx.lineWidth = isSelected ? 2 : 1;
-    const dash = linetypeDashPattern(layerLinetype(entity.layer));
+    ctx.lineWidth = strokeWidthFromEntity(entity, isSelected);
+    const dashBase = resolveEntityDashPattern(entity);
+    const dash = scaleDashPatternForScreen(dashBase, resolveEntityLinetypeScale(entity));
     ctx.setLineDash(dash);
+    ctx.lineDashOffset = -(Number(entity?.linetypePhase ?? 0) * currentZoom);
     const clip = entity.viewportClip;
     if (clip && Number.isFinite(clip.minX) && Number.isFinite(clip.minY) && Number.isFinite(clip.maxX) && Number.isFinite(clip.maxY)) {
       const pA = getScreenPoint(clip.minX, clip.maxY);
@@ -1688,6 +2463,7 @@ function renderFrame() {
     if (clip) {
       ctx.restore();
     }
+    ctx.lineDashOffset = 0;
   }
 
   if (activeSnap) {
@@ -2155,6 +2931,78 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
     return fallback;
   }
 
+  function resolveDimAciColor(raw, fallbackLayer = null) {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0 || n === 256) return layerColor(fallbackLayer) || null;
+    return aciToHex(n);
+  }
+
+  function normalizeLineweightMm(raw, fallback = null) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) {
+      if (Number.isInteger(n) && n <= 211) return n / 100;
+      if (!Number.isInteger(n) && n < 10) return n;
+    }
+    return fallback;
+  }
+
+  function deriveStyle(baseStyle, overrides = {}) {
+    const layer = overrides.layer || baseStyle?.layer;
+    const linetype = resolveLinetypeName(
+      overrides.linetype ?? baseStyle?.linetype,
+      layer
+    );
+    const linetypePattern = normalizeDashPattern(overrides.linetypePattern)
+      || baseStyle?.linetypePattern
+      || layerLinetypePattern(layer);
+    const lineweightMm = normalizeLineweightMm(overrides.lineweightMm, baseStyle?.lineweightMm ?? layerLineweightMm(layer));
+    return {
+      ...(baseStyle || {}),
+      layer,
+      color: overrides.color || baseStyle?.color || layerColor(layer) || null,
+      linetype,
+      linetypePattern,
+      linetypeScale: Number.isFinite(Number(overrides.linetypeScale)) ? Number(overrides.linetypeScale) : (baseStyle?.linetypeScale ?? 1),
+      linetypePhase: Number.isFinite(Number(overrides.linetypePhase)) ? Number(overrides.linetypePhase) : (baseStyle?.linetypePhase ?? 0),
+      lineweightMm
+    };
+  }
+
+  function dimensionChannelStyle(entity, baseStyle, channel = 'line') {
+    const dimStyleObj = entity?.dimStyle || entity?.dimstyle || entity?.style || entity?.dimensionStyle || null;
+    const dimVar = (...keys) => {
+      for (const key of keys) {
+        if (entity && entity[key] !== undefined && entity[key] !== null) return entity[key];
+        if (dimStyleObj && dimStyleObj[key] !== undefined && dimStyleObj[key] !== null) return dimStyleObj[key];
+      }
+      return null;
+    };
+
+    const key = String(channel || 'line').toLowerCase();
+    const isText = key === 'text';
+    const isExt = key === 'ext';
+    const colorRaw = isText
+      ? dimVar('dimclrt', 'textColorIndex', 'textColor')
+      : (isExt ? dimVar('dimclre', 'extLineColorIndex', 'extLineColor') : dimVar('dimclrd', 'dimLineColorIndex', 'dimLineColor'));
+    const color = resolveDimAciColor(colorRaw, baseStyle?.layer) || baseStyle?.color || null;
+
+    const linetypeRaw = isExt
+      ? dimVar('dimltex1', 'dimltex2', 'extLineType', 'extLinetype')
+      : dimVar('dimltype', 'dimLineType', 'dimLinetype');
+    const lineweightRaw = isExt
+      ? dimVar('dimlwe', 'extLineWeight', 'extLineweight')
+      : dimVar('dimlwd', 'dimLineWeight', 'dimLineweight');
+
+    const linetypeScaleRaw = dimVar('dimltscale', 'linetypeScale', 'lineTypeScale');
+
+    return deriveStyle(baseStyle, {
+      color,
+      linetype: linetypeRaw,
+      lineweightMm: normalizeLineweightMm(lineweightRaw),
+      linetypeScale: Number.isFinite(Number(linetypeScaleRaw)) ? Number(linetypeScaleRaw) : undefined
+    });
+  }
+
   function addFilledTriangle(a, b, c, style) {
     const ent = {
       id: nextEntityId++,
@@ -2555,6 +3403,10 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
   }
 
   function classifyEntitySpace(entity) {
+    const explicitSpace = String(entity?.entitySpace ?? '').toLowerCase();
+    if (explicitSpace.includes('paper')) return 'paper';
+    if (explicitSpace.includes('model')) return 'model';
+
     const boolFlag = entity?.paperSpace ?? entity?.paperspace ?? entity?.inPaperSpace ?? entity?.isPaperSpace;
     if (typeof boolFlag === 'boolean') return boolFlag ? 'paper' : 'model';
 
@@ -2567,6 +3419,7 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
     const textFlag = String(entity?.space ?? entity?.ownerSpace ?? entity?.layout ?? entity?.layoutName ?? '').toLowerCase();
     if (textFlag.includes('paper')) return 'paper';
     if (textFlag.includes('model')) return 'model';
+
     return 'unknown';
   }
 
@@ -2628,9 +3481,24 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
   }
 
   function getStyle(e, layer) {
+    const linetype = resolveLinetypeName(
+      e?.lineTypeName ?? e?.linetype ?? e?.lineType ?? e?.ltype,
+      layer
+    );
+    const linetypePattern = normalizeDashPattern(
+      e?.lineTypePattern ?? e?.linetypePattern ?? e?.dashPattern ?? e?.pattern
+    ) || layerLinetypePattern(layer);
+    const linetypeScale = resolveEntityLinetypeScale(e);
+    const linetypePhase = Number(e?.linetypePhase ?? e?.lineTypePhase ?? e?.dashOffset ?? 0);
+    const lineweightMm = resolveEntityLineweightMm(e);
     return {
       layer,
-      color: extractEntityColor(e, layer) || layerColor(layer) || null
+      color: extractEntityColor(e, layer) || layerColor(layer) || null,
+      linetype,
+      linetypePattern,
+      linetypeScale,
+      linetypePhase: Number.isFinite(linetypePhase) ? linetypePhase : 0,
+      lineweightMm
     };
   }
 
@@ -2644,6 +3512,11 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
       y2,
       layer: style?.layer,
       color: style?.color,
+      linetype: style?.linetype,
+      linetypePattern: style?.linetypePattern,
+      linetypeScale: style?.linetypeScale,
+      linetypePhase: style?.linetypePhase,
+      lineweightMm: style?.lineweightMm,
       viewportClip: activeClip()
     };
     out.push(setBBox(ent, x1, y1, x2, y2));
@@ -2696,13 +3569,32 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
       clockwise: !!norm.clockwise,
       layer: style?.layer,
       color: style?.color,
+      linetype: style?.linetype,
+      linetypePattern: style?.linetypePattern,
+      linetypeScale: style?.linetypeScale,
+      linetypePhase: style?.linetypePhase,
+      lineweightMm: style?.lineweightMm,
       viewportClip: activeClip()
     };
     out.push(setBBox(ent, x - r, y - r, x + r, y + r));
   }
 
   function addCircle(x, y, r, style) {
-    const ent = { id: nextEntityId++, type: 'circle', x, y, r, layer: style?.layer, color: style?.color, viewportClip: activeClip() };
+    const ent = {
+      id: nextEntityId++,
+      type: 'circle',
+      x,
+      y,
+      r,
+      layer: style?.layer,
+      color: style?.color,
+      linetype: style?.linetype,
+      linetypePattern: style?.linetypePattern,
+      linetypeScale: style?.linetypeScale,
+      linetypePhase: style?.linetypePhase,
+      lineweightMm: style?.lineweightMm,
+      viewportClip: activeClip()
+    };
     out.push(setBBox(ent, x - r, y - r, x + r, y + r));
   }
 
@@ -2858,7 +3750,10 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
     renderStats.processed++;
 
     const forceSpace = !!opts?.forceSpace;
-    const entitySpace = classifyEntitySpace(e);
+    const inheritedSpace = opts?.spaceOverride;
+    const entitySpace = (inheritedSpace === 'paper' || inheritedSpace === 'model')
+      ? inheritedSpace
+      : classifyEntitySpace(e);
     if (!forceSpace && !shouldRenderEntitySpace(entitySpace)) {
       renderStats.skipped++;
       return;
@@ -3197,7 +4092,10 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
         break;
       }
       case 'MLEADER':
-      case 'MULTILEADER': {
+      case 'MULTILEADER':
+      case 'MLeader':
+      case 'MultiLeader':
+      case 'ACDBMLEADER': {
         const textValue =
           e.text ||
           e.plainText ||
@@ -3233,7 +4131,10 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
           e.lines,
           e.contextData?.leaders,
           e.contextData?.leaderLines,
-          e.contextData?.leaderLinePoints
+          e.contextData?.leaderLinePoints,
+          e.mleader?.leaders,
+          e.mleader?.leaderLines,
+          e.mleader?.leaderLinePoints
         ];
         const leaderPointSets = [];
 
@@ -3269,6 +4170,36 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
         for (const ls of rawLeaderSets) {
           if (!Array.isArray(ls)) continue;
           for (const seg of ls) pushLeaderPoints(seg);
+        }
+
+        // Some MLeader payloads expose only an overall extents box (min/max points)
+        // with text, but no explicit leader vertex arrays. Synthesize one leader
+        // segment so the entity is still visible.
+        if (leaderPointSets.length === 0) {
+          const minPt = resolvePoint(
+            e.minPoint,
+            e.min,
+            e.extents?.min,
+            e.boundingBox?.min,
+            (Number.isFinite(e.minX) && Number.isFinite(e.minY)) ? { x: e.minX, y: e.minY } : null
+          );
+          const maxPt = resolvePoint(
+            e.maxPoint,
+            e.max,
+            e.extents?.max,
+            e.boundingBox?.max,
+            (Number.isFinite(e.maxX) && Number.isFinite(e.maxY)) ? { x: e.maxX, y: e.maxY } : null
+          );
+          if (minPt && maxPt) {
+            const dx = Number(maxPt.x) - Number(minPt.x);
+            const dy = Number(maxPt.y) - Number(minPt.y);
+            if (Number.isFinite(dx) && Number.isFinite(dy) && (Math.abs(dx) > 1e-9 || Math.abs(dy) > 1e-9)) {
+              leaderPointSets.push([
+                { x: Number(minPt.x), y: Number(minPt.y) },
+                { x: Number(maxPt.x), y: Number(maxPt.y) }
+              ]);
+            }
+          }
         }
 
         let inferredTextPosWorld = null;
@@ -3389,9 +4320,12 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
               const tChild = hasBase
                 ? combineTransform(tBlock, { tx: -base.x, ty: -base.y, sx: 1, sy: 1, rot: 0 })
                 : tBlock;
+              const childOpts = (entitySpace === 'paper' || entitySpace === 'model')
+                ? { ...(opts || {}), spaceOverride: entitySpace }
+                : opts;
 
               for (const sub of child) {
-                processEntity(sub, tChild, depth + 1, layer, opts);
+                processEntity(sub, tChild, depth + 1, layer, childOpts);
               }
 
               renderStats.diagnostics.mleaderBlockRendered = (renderStats.diagnostics.mleaderBlockRendered || 0) + 1;
@@ -3493,6 +4427,17 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
       case 'DIMENSION': {
         // Use entity/layer color as-is — no hardcoded overrides.
         const dimStyle = style;
+        const dimLineStyle = dimensionChannelStyle(e, dimStyle, 'line');
+        const extLineStyle = dimensionChannelStyle(e, dimStyle, 'ext');
+        const dimTextStyle = dimensionChannelStyle(e, dimStyle, 'text');
+        const dimStyleObj = e?.dimStyle || e?.dimstyle || e?.style || e?.dimensionStyle || null;
+        const dimVar = (...keys) => {
+          for (const key of keys) {
+            if (e && e[key] !== undefined && e[key] !== null) return e[key];
+            if (dimStyleObj && dimStyleObj[key] !== undefined && dimStyleObj[key] !== null) return dimStyleObj[key];
+          }
+          return null;
+        };
         const dimTypeRaw = Number(e.dimensionType ?? e.dimType ?? -1);
         const dimType = Number.isFinite(dimTypeRaw) ? (dimTypeRaw & 0x0f) : -1;
         const isRotatedLinear = dimType === 0;
@@ -3505,7 +4450,11 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
         const pt1 = e.subDefinitionPoint1 || e.firstPoint || e.extLine1Point;
         const pt2 = e.subDefinitionPoint2 || e.secondPoint || e.extLine2Point;
         const defPt = e.definitionPoint || e.anchorPoint;
-        const textH = transformedTextHeight(e.textHeight || e.nominalTextHeight || 2.5, t);
+        const dimTxt = Number(dimVar('dimtxt', 'dimTextHeight'));
+        const baseTextH = Number.isFinite(dimTxt) && dimTxt > 0
+          ? dimTxt
+          : (e.textHeight || e.nominalTextHeight || 2.5);
+        const textH = transformedTextHeight(baseTextH, t);
         const unitScale = transformedUnitScale(t);
 
         // Resolve text position early so the linear dim line can break around it.
@@ -3517,11 +4466,16 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
           const pd = transformPoint(defPt, t);
           const dirSrc = normalizeVec(p2.x - p1.x, p2.y - p1.y);
           const angle = Number(e.angle ?? e.rotation ?? e.dimensionLineAngle);
+          const angleRad = inferAngleRadians(
+            angle,
+            e.angleUnit ?? e.angleUnits ?? e.rotationUnit ?? e.units,
+            true
+          );
           // DIMENSION type 0 (rotated/linear) should be orthogonal if angle is absent.
           // Type 1 (aligned) follows the measured segment direction.
           const axisDir = axisAlignedDirection(p1, p2);
           const dir = Number.isFinite(angle)
-            ? { x: Math.cos(toRadians(angle) + (t.rot || 0)), y: Math.sin(toRadians(angle) + (t.rot || 0)) }
+            ? { x: Math.cos(angleRad + (t.rot || 0)), y: Math.sin(angleRad + (t.rot || 0)) }
             : (isAlignedLinear ? { x: dirSrc.x, y: dirSrc.y } : axisDir);
           const nd = normalizeVec(dir.x, dir.y);
           const normal = { x: -nd.y, y: nd.x };
@@ -3534,19 +4488,28 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
           // point is on either side of the dimension line.
           const sign1 = off1 >= 0 ? 1 : -1;
           const sign2 = off2 >= 0 ? 1 : -1;
-          const extGap  = Math.max(textH * 0.12, 0.4 * unitScale);  // gap from reference point
-          const extOver = Math.max(textH * 0.35, 1.2 * unitScale);  // overshoot past dimension line
+          const dimExo = Number(dimVar('dimexo', 'extLineOffset'));
+          const dimExe = Number(dimVar('dimexe', 'extLineExtension'));
+          const extGap  = Number.isFinite(dimExo) && dimExo >= 0
+            ? Math.max(dimExo * unitScale, 0.15 * unitScale)
+            : Math.max(textH * 0.12, 0.4 * unitScale);  // gap from reference point
+          const extOver = Number.isFinite(dimExe) && dimExe >= 0
+            ? Math.max(dimExe * unitScale, 0.25 * unitScale)
+            : Math.max(textH * 0.35, 1.2 * unitScale);  // overshoot past dimension line
           addLine(
             p1.x + sign1 * normal.x * extGap, p1.y + sign1 * normal.y * extGap,
             d1.x + sign1 * normal.x * extOver, d1.y + sign1 * normal.y * extOver,
-            dimStyle
+            extLineStyle
           );
           addLine(
             p2.x + sign2 * normal.x * extGap, p2.y + sign2 * normal.y * extGap,
             d2.x + sign2 * normal.x * extOver, d2.y + sign2 * normal.y * extOver,
-            dimStyle
+            extLineStyle
           );
-          const arr = Math.max(textH * 0.9, 1.6 * unitScale);
+          const dimAsz = Number(dimVar('dimasz', 'arrowSize'));
+          const arr = Number.isFinite(dimAsz) && dimAsz > 0
+            ? Math.max(dimAsz * unitScale, 0.6 * unitScale)
+            : Math.max(textH * 0.9, 1.6 * unitScale);
           const dimLen = distance(d1, d2);
           const lineDir = normalizeVec(d2.x - d1.x, d2.y - d1.y);
           // Break the dimension line around the text position (standard CAD presentation).
@@ -3558,14 +4521,14 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
           const gapL = projTxt - textGap;
           const gapR = projTxt + textGap;
           if (dimLen > 2 * arr + textH && gapL > arr * 0.5 && gapR < dimLen - arr * 0.5) {
-            addLine(d1.x, d1.y, d1.x + lineDir.x * gapL, d1.y + lineDir.y * gapL, dimStyle);
-            addLine(d1.x + lineDir.x * gapR, d1.y + lineDir.y * gapR, d2.x, d2.y, dimStyle);
+            addLine(d1.x, d1.y, d1.x + lineDir.x * gapL, d1.y + lineDir.y * gapL, dimLineStyle);
+            addLine(d1.x + lineDir.x * gapR, d1.y + lineDir.y * gapR, d2.x, d2.y, dimLineStyle);
           } else {
-            addLine(d1.x, d1.y, d2.x, d2.y, dimStyle);
+            addLine(d1.x, d1.y, d2.x, d2.y, dimLineStyle);
           }
           const dimArrowStyle = arrowStyleForEntity(e, 'closed-filled');
-          addArrowHead(d1, { x: d2.x - d1.x, y: d2.y - d1.y }, arr, dimStyle, dimArrowStyle);
-          addArrowHead(d2, { x: d1.x - d2.x, y: d1.y - d2.y }, arr, dimStyle, dimArrowStyle);
+          addArrowHead(d1, { x: d2.x - d1.x, y: d2.y - d1.y }, arr, dimLineStyle, dimArrowStyle);
+          addArrowHead(d2, { x: d1.x - d2.x, y: d1.y - d2.y }, arr, dimLineStyle, dimArrowStyle);
         } else if (isRadius || isDiameter) {
           const cp = e.centerPoint || e.center;
           const rp = e.definitionPoint || e.anchorPoint || e.chordPoint || e.firstPoint;
@@ -3574,14 +4537,14 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
             const r = transformPoint(rp, t);
             if (isDiameter) {
               const opp = { x: c.x - (r.x - c.x), y: c.y - (r.y - c.y) };
-              addLine(opp.x, opp.y, r.x, r.y, dimStyle);
+              addLine(opp.x, opp.y, r.x, r.y, dimLineStyle);
               const arr = Math.max(textH * 0.9, 1.6 * unitScale);
               const dimArrowStyle = arrowStyleForEntity(e, 'closed-filled');
-              addArrowHead(r, { x: c.x - r.x, y: c.y - r.y }, arr, dimStyle, dimArrowStyle);
-              addArrowHead(opp, { x: c.x - opp.x, y: c.y - opp.y }, arr, dimStyle, dimArrowStyle);
+              addArrowHead(r, { x: c.x - r.x, y: c.y - r.y }, arr, dimLineStyle, dimArrowStyle);
+              addArrowHead(opp, { x: c.x - opp.x, y: c.y - opp.y }, arr, dimLineStyle, dimArrowStyle);
             } else {
-              addLine(c.x, c.y, r.x, r.y, dimStyle);
-              addArrowHead(r, { x: c.x - r.x, y: c.y - r.y }, Math.max(textH * 0.9, 1.6 * unitScale), dimStyle, arrowStyleForEntity(e, 'closed-filled'));
+              addLine(c.x, c.y, r.x, r.y, dimLineStyle);
+              addArrowHead(r, { x: c.x - r.x, y: c.y - r.y }, Math.max(textH * 0.9, 1.6 * unitScale), dimLineStyle, arrowStyleForEntity(e, 'closed-filled'));
             }
           }
         } else if (isAngular) {
@@ -3601,18 +4564,18 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
               while (span <= -Math.PI) span += Math.PI * 2;
               while (span > Math.PI) span -= Math.PI * 2;
               const end = a1 + span;
-              addArc(c.x, c.y, rr, a1, end, dimStyle, span < 0);
+              addArc(c.x, c.y, rr, a1, end, dimLineStyle, span < 0);
               const e1 = { x: c.x + Math.cos(a1) * rr, y: c.y + Math.sin(a1) * rr };
               const e2 = { x: c.x + Math.cos(end) * rr, y: c.y + Math.sin(end) * rr };
               // Extension lines from arm endpoints to the arc radius
               const r1 = distance(c, p1);
               const r2 = distance(c, p2);
-              if (r1 > rr * 0.1) addLine(p1.x, p1.y, c.x + (p1.x - c.x) * (rr / r1), c.y + (p1.y - c.y) * (rr / r1), dimStyle);
-              if (r2 > rr * 0.1) addLine(p2.x, p2.y, c.x + (p2.x - c.x) * (rr / r2), c.y + (p2.y - c.y) * (rr / r2), dimStyle);
+              if (r1 > rr * 0.1) addLine(p1.x, p1.y, c.x + (p1.x - c.x) * (rr / r1), c.y + (p1.y - c.y) * (rr / r1), extLineStyle);
+              if (r2 > rr * 0.1) addLine(p2.x, p2.y, c.x + (p2.x - c.x) * (rr / r2), c.y + (p2.y - c.y) * (rr / r2), extLineStyle);
               const arr = Math.max(textH * 0.8, 1.4 * unitScale);
               const dimArrowStyle = arrowStyleForEntity(e, 'closed-filled');
-              addArrowHead(e1, { x: -Math.sin(a1), y: Math.cos(a1) }, arr, dimStyle, dimArrowStyle);
-              addArrowHead(e2, { x: Math.sin(end), y: -Math.cos(end) }, arr, dimStyle, dimArrowStyle);
+              addArrowHead(e1, { x: -Math.sin(a1), y: Math.cos(a1) }, arr, dimLineStyle, dimArrowStyle);
+              addArrowHead(e2, { x: Math.sin(end), y: -Math.cos(end) }, arr, dimLineStyle, dimArrowStyle);
             }
           }
         } else if (isOrdinate) {
@@ -3625,10 +4588,10 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
             const lp = transformPoint(ledPt, t);
             // Small cross at the feature point to mark the measured location
             const tick = Math.max(textH * 0.25, 0.5 * unitScale);
-            addLine(fp.x - tick, fp.y, fp.x + tick, fp.y, dimStyle);
-            addLine(fp.x, fp.y - tick, fp.x, fp.y + tick, dimStyle);
+            addLine(fp.x - tick, fp.y, fp.x + tick, fp.y, dimLineStyle);
+            addLine(fp.x, fp.y - tick, fp.x, fp.y + tick, dimLineStyle);
             if (distance(fp, lp) > tick * 2) {
-              addLine(fp.x, fp.y, lp.x, lp.y, dimStyle);
+              addLine(fp.x, fp.y, lp.x, lp.y, dimLineStyle);
             }
           }
         } else if (defPt) {
@@ -3637,7 +4600,7 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
           if (cp) {
             const c = transformPoint(cp, t);
             const d = transformPoint(defPt, t);
-            addLine(c.x, c.y, d.x, d.y, dimStyle);
+            addLine(c.x, c.y, d.x, d.y, dimLineStyle);
           }
         }
         // Dimension text
@@ -3660,15 +4623,19 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
             const n = Number(e.measurement ?? e.actualMeasurement);
             val = formatDimensionMeasurement(n, unitsCode);
           }
-          const rotation = e.textRotation ?? e.ocsRotation ?? e.rotation ?? e.dimensionLineAngle ?? 0;
           if (val && val !== '[]') {
+            const rotationRad = inferAngleRadians(
+              e.textRotation ?? e.ocsRotation ?? e.rotation ?? e.dimensionLineAngle ?? 0,
+              e.textAngleUnit ?? e.rotationUnit ?? e.angleUnit ?? e.angleUnits,
+              true
+            );
             addText(
               txtPos.x,
               txtPos.y,
               val,
               transformedTextHeight(e.textHeight || e.nominalTextHeight || 2.5, t),
-              toRadians(rotation) + (t.rot || 0),
-              dimStyle,
+              rotationRad + (t.rot || 0),
+              dimTextStyle,
               'dimension',
               { alignX: 'center', alignY: 'middle' }
             );
@@ -3742,11 +4709,14 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
           const tChild = hasBase
             ? combineTransform(t2, { tx: -base.x, ty: -base.y, sx: 1, sy: 1, rot: 0 })
             : t2;
+          const childOpts = (entitySpace === 'paper' || entitySpace === 'model')
+            ? { ...(opts || {}), spaceOverride: entitySpace }
+            : opts;
           if (child && Array.isArray(child)) {
             for (const sub of child) {
               // ATTRIBs are rendered from INSERT.attribs/top-level list; avoid duplicates.
               if (sub?.type === 'ATTRIB' || sub?.type === 'ATTDEF') continue;
-              processEntity(sub, tChild, depth + 1, layer, opts);
+              processEntity(sub, tChild, depth + 1, layer, childOpts);
             }
           }
 
@@ -3817,7 +4787,7 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
               at?.contextData?.textLocation
             );
             if (atPos) {
-              processEntity(at, tChild, depth + 1, layer, opts);
+              processEntity(at, tChild, depth + 1, layer, childOpts);
               const tagKey = normalizeTagKey(at?.tag || at?.name);
               if (tagKey) consumedTags.add(tagKey);
               continue;
@@ -3834,7 +4804,7 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
                 rotation: at?.rotation ?? anchor.rotation,
                 textHeight: at?.textHeight ?? at?.height ?? anchor.height
               };
-              processEntity(patched, tChild, depth + 1, layer, opts);
+              processEntity(patched, tChild, depth + 1, layer, childOpts);
               if (tag) consumedTags.add(tag);
             } else {
               // Keep diagnostics so we can continue tightening anchor recovery.
@@ -3858,7 +4828,7 @@ function convertDXFEntities(dxfEntities, dxfBlocks = null, parseSource = 'unknow
                 rotation: anchor.rotation,
                 textHeight: anchor.height
               };
-              processEntity(placeholder, tChild, depth + 1, layer, opts);
+              processEntity(placeholder, tChild, depth + 1, layer, childOpts);
             }
           }
         }

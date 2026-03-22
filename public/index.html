@@ -203,11 +203,12 @@
       font-size: 11.5px;
       font-family: 'Segoe UI', 'Consolas', sans-serif;
       line-height: 1.65;
-      white-space: pre;
+      white-space: normal;
+      overflow-wrap: anywhere;
       z-index: 9999;
       box-shadow: 0 3px 12px rgba(0,0,0,0.45);
       display: none;
-      max-width: 340px;
+      max-width: 460px;
     }
     #hoverTooltip .tt-type {
       font-weight: 600;
@@ -222,6 +223,177 @@
     #hoverTooltip .tt-label {
       color: #7a8ca0;
     }
+
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 32, 0.48);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 10000;
+      padding: 20px;
+    }
+
+    .modal-backdrop.open {
+      display: flex;
+    }
+
+    .modal-card {
+      width: min(560px, 100%);
+      background: #f7f9fb;
+      border: 1px solid #c8d1d9;
+      border-radius: 10px;
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.22);
+      overflow: hidden;
+    }
+
+    .modal-header {
+      padding: 14px 16px;
+      background: #243746;
+      color: white;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .modal-header h2 {
+      font-size: 16px;
+      font-weight: 600;
+    }
+
+    .modal-body {
+      padding: 16px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px 14px;
+    }
+
+    .modal-field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .modal-field.full {
+      grid-column: 1 / -1;
+    }
+
+    .modal-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: #314657;
+    }
+
+    .modal-input,
+    .modal-select {
+      border: 1px solid #bcc7d1;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 13px;
+      color: #21313f;
+      background: white;
+    }
+
+    .modal-checks {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px 12px;
+    }
+
+    .modal-check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: #314657;
+    }
+
+    .modal-footer {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      padding: 14px 16px 16px;
+      background: #edf2f6;
+    }
+
+    .modal-btn {
+      border: 1px solid #b9c5cf;
+      background: white;
+      color: #233542;
+      border-radius: 6px;
+      padding: 8px 14px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .modal-btn.primary {
+      background: #1f6fb2;
+      border-color: #1f6fb2;
+      color: white;
+    }
+
+    .print-note {
+      font-size: 11.5px;
+      color: #5d6d7a;
+      line-height: 1.45;
+    }
+
+    .print-preview-wrap {
+      border: 1px solid #cad4dc;
+      border-radius: 8px;
+      background: #dfe6ec;
+      padding: 10px;
+    }
+
+    #printPreviewCanvas {
+      width: 100%;
+      height: 280px;
+      display: block;
+      border-radius: 6px;
+      background: #dfe6ec;
+    }
+
+    #printPreviewSummary {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #425564;
+    }
+
+    @media print {
+      body {
+        background: white;
+      }
+
+      .header,
+      .toolbar,
+      .properties-panel,
+      .drop-zone,
+      .error,
+      #hoverTooltip,
+      .modal-backdrop {
+        display: none !important;
+      }
+
+      .container,
+      .main-content,
+      .canvas-container {
+        display: block;
+        height: auto;
+        overflow: visible;
+        background: white;
+      }
+
+      #canvas {
+        display: block !important;
+        width: 100% !important;
+        height: auto !important;
+        max-width: none;
+        max-height: none;
+        border: none;
+        margin: 0;
+      }
+    }
   </style>
 </head>
 <body>
@@ -234,6 +406,7 @@
     <div class="main-content">
       <div class="toolbar">
         <button class="tool-btn" id="openBtn" title="Open File (Ctrl+O)">📁</button>
+        <button class="tool-btn" id="printBtn" title="Print Drawing (Ctrl+P)">🖨</button>
         <button class="tool-btn" id="zoomInBtn" title="Zoom In">🔍+</button>
         <button class="tool-btn" id="zoomOutBtn" title="Zoom Out">🔍-</button>
         <button class="tool-btn" id="fitBtn" title="Fit to Screen">⬜</button>
@@ -260,7 +433,15 @@
           </div>
           <div class="property-item">
             <span class="property-label">Units:</span>
-            <span class="property-value" id="units">Unknown</span>
+            <select id="unitsConversionSelect" class="property-input" style="flex: 1; margin-left: 8px;">
+              <option value="default">Default (from file)</option>
+              <option value="mm">Millimeters</option>
+              <option value="cm">Centimeters</option>
+              <option value="m">Meters</option>
+              <option value="in">Inches</option>
+              <option value="ft">Feet</option>
+              <option value="yd">Yards</option>
+            </select>
           </div>
           <div class="property-item">
             <span class="property-label">Version:</span>
@@ -326,6 +507,74 @@
   </div>
 
   <div id="hoverTooltip" role="tooltip" aria-hidden="true"></div>
+
+  <div id="printModal" class="modal-backdrop" aria-hidden="true">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="printModalTitle">
+      <div class="modal-header">
+        <h2 id="printModalTitle">Print Drawing</h2>
+      </div>
+      <div class="modal-body">
+        <label class="modal-field">
+          <span class="modal-label">Page Size</span>
+          <select id="printPageSize" class="modal-select">
+            <option value="Letter">Letter</option>
+            <option value="Legal">Legal</option>
+            <option value="Tabloid">Tabloid</option>
+            <option value="A4">A4</option>
+            <option value="A3">A3</option>
+          </select>
+        </label>
+        <label class="modal-field">
+          <span class="modal-label">Orientation</span>
+          <select id="printOrientation" class="modal-select">
+            <option value="landscape">Landscape</option>
+            <option value="portrait">Portrait</option>
+          </select>
+        </label>
+        <label class="modal-field">
+          <span class="modal-label">Fit</span>
+          <select id="printFitMode" class="modal-select">
+            <option value="fit-page">Fit Entire Drawing</option>
+            <option value="fit-width">Fit Drawing Width</option>
+            <option value="fit-current-view">Fit Current View</option>
+          </select>
+        </label>
+        <label class="modal-field">
+          <span class="modal-label">Scale (%)</span>
+          <input id="printScale" class="modal-input" type="number" min="10" max="400" step="5" value="100">
+        </label>
+        <label class="modal-field">
+          <span class="modal-label">Margins (in)</span>
+          <input id="printMarginInches" class="modal-input" type="number" min="0" max="2" step="0.05" value="0.25">
+        </label>
+        <div class="modal-field">
+          <span class="modal-label">Output</span>
+          <div class="modal-checks">
+            <label class="modal-check"><input id="printMonochrome" type="checkbox"> Monochrome</label>
+            <label class="modal-check"><input id="printBackground" type="checkbox"> Print background</label>
+            <label class="modal-check"><input id="printAnnotations" type="checkbox" checked> Include annotations</label>
+            <label class="modal-check"><input id="printHatches" type="checkbox" checked> Include hatches</label>
+          </div>
+        </div>
+        <div class="modal-field full">
+          <div class="print-note">
+            The viewer will temporarily prepare the drawing for printing using the selected fit and display options, then restore your normal view after the system print dialog closes.
+          </div>
+        </div>
+        <div class="modal-field full">
+          <span class="modal-label">Preview</span>
+          <div class="print-preview-wrap">
+            <canvas id="printPreviewCanvas"></canvas>
+            <div id="printPreviewSummary">Preview unavailable</div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="printCancelBtn" class="modal-btn" type="button">Cancel</button>
+        <button id="printConfirmBtn" class="modal-btn primary" type="button">Print</button>
+      </div>
+    </div>
+  </div>
   <script src="renderer.js"></script>
 </body>
 </html>
